@@ -1,0 +1,31 @@
+[package]
+name = "ken"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Jishuken: self-verifying memory for agents, with jujutsu as the storage spine."
+
+[lib]
+name = "ken"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ken"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+clap.workspace = true
+toml.workspace = true
+regex.workspace = true
+rmcp.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

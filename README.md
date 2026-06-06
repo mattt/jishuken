@@ -1,0 +1,486 @@
+# Jishuken
+
+Self-verifying memory for agents.
+`ken` keeps a store of facts,
+tracks how much it should still believe each one,
+and re-checks the ones that matter before they go stale enough to mislead anything.
+
+> **Status:** early.
+> The model is settled (see `DESIGN.md` and `THREAT-MODEL.md`);
+> the implementation is in progress.
+> Typed ground sources, locators, `ken ground`, and multi-ground conflicts are implemented,
+> except tree-sitter locators (`#ts:`), which parse but do not yet resolve;
+> use a heading, quoted substring, or line-range locator in the meantime.
+> `ken` pins to a specific `jj` version until jj reaches 1.0.
+
+## The problem
+
+An agent's memory fills up with facts,
+and the facts quietly rot.
+The wiki still says auth lives in `src/middleware/auth.ts`,
+but the code moved it two refactors ago.
+A runbook describes a release process one reorg out of date,
+a staging URL moves,
+a dependency bumps a major version,
+and the agent keeps acting on what was true last quarter.
+Keeping all of it current has no upper bound on effort,
+so the only sane policy is to spend verification where being wrong is expensive and let the rest decay.
+
+`ken` does two things to make that policy work.
+It keeps what it *believes* separate from what it has actually *checked*,
+so a confident guess never gets mistaken for a confirmed fact.
+And it schedules its own re-verification by expected value,
+so the budget goes to the facts most likely to be both wrong and consequential.
+
+## Model
+
+There are two kinds of thing in the store.
+
+A **ground source** is read, never believed:
+a repo at a revision, a URL, a file, a command, or the store's own operation log.
+It has no staleness because it is not a claim about the truth.
+It is the truth at read time.
+
+A **derived fact** is believed and needs verification.
+Two values ride on it that must never collapse into one.
+**Confidence** is how much to believe it,
+and it decays over time at a rate set by the fact's volatility.
+**Groundedness** is whether it was ever checked against a ground source,
+or is still a guess.
+A high-confidence guess and a high-confidence verified fact are different objects,
+and `ken` will not let you confuse them.
+
+Checking a fact splits into two stages that stay separate.
+A fact's **source** is read to a span,
+and a **predicate** judges that span against the claim.
+The split is the point.
+The predicate is pure: the same span always yields the same verdict, so it cannot rot.
+Everything that can drift, the file, the endpoint, the network in between, lives on the reading side,
+which is also where the cost and the capabilities sit.
+A file read is cheap and trusted and runs often;
+a command or a networked fetch costs more, counts for less because the channel can lie, and runs on a schedule.
+
+The **scheduler** ranks facts by the expected value of checking them,
+roughly the chance a fact is wrong times the cost of acting on it wrong,
+divided by what the check costs.
+On top of that sits a small floor of random audits,
+routed through an independent check rather than the one that last certified the fact,
+so a confidently-wrong belief cannot sit undisturbed forever.
+
+### Sources and locators
+
+A ground source is more than a file path.
+It is a typed reference to where the truth lives and a *locator* that points at the span within it,
+so a fact records not "checked against `Architecture.md`" but "checked against its `## Authentication` section, at wiki revision `9f12`, whose span hashed to `b7c4`."
+Pin the revision and you can prove later what the verifier actually saw.
+Hash the span and a replay against a since-changed source no longer passes for a fresh confirmation.
+
+The locator is whatever fits the shape of the content, and one fact may carry several:
+
+| locator                    | points at                                       |
+|----------------------------|-------------------------------------------------|
+| `Doc.md#heading`           | a Markdown section                              |
+| `Doc.md?q="…"`             | a quoted substring, re-found if it drifts       |
+| `file#L40-58`              | a line range, always bound by the span's hash   |
+| `file#ts:(query)`          | a tree-sitter match, for code or any grammar    |
+| `https://…#section`        | a fragment of an external page                  |
+| `notion:<id>`, `drive:<id>`| a block in a connected system                   |
+
+Line numbers shift the moment someone edits above them,
+so a raw range is the weakest anchor and `ken` always pairs it with the span's content hash.
+A heading or a tree-sitter query survives edits elsewhere in the file,
+which is why they are the preferred anchors for prose and for code respectively.
+
+### The store is a jj repo
+
+`ken` does not reimplement version control.
+The store is a Jujutsu repository,
+and the belief machinery falls out of jj's primitives:
+
+| `ken` concept                  | jj primitive            |
+|--------------------------------|-------------------------|
+| fact identity (stable)         | change ID               |
+| fact version (per update)      | commit ID               |
+| two answers held at once       | first-class conflict    |
+| the audit log (a ground source)| operation log           |
+| a hypothesis you test and keep | anonymous change        |
+| roll the store back            | `jj op restore`         |
+
+Facts are files in that repo,
+so the whole store greps, diffs, and reviews like code,
+because it is code-shaped on disk.
+
+### Where the store lives
+
+The store is a `.ken/` directory.
+`ken` finds it by walking up from the working directory,
+the way `jj` finds `.jj/`,
+so each project keeps its own beliefs and the right store is the one you are standing in.
+Point somewhere else with `--store` or `KEN_STORE` when you want a shared or global store.
+
+A project that uses `ken` therefore holds two repositories:
+its own `.jj/` for code,
+and a `.ken/` that is itself a jj repo for beliefs.
+`ken` always operates on `.ken/` explicitly and never inherits ambient jj repo discovery,
+so the store is a jj repo `ken` happens to use,
+not the repo you are standing in.
+
+## Install
+
+```sh
+cargo install ken
+ken init        # create a .ken/ store in the current project
+```
+
+## CLI
+
+`ken` has two planes.
+The **data plane** writes facts that arrive unverified,
+and it is the only plane untrusted callers ever touch.
+The **control plane** is where truth gets asserted and privileges get granted,
+and every command in it is logged loudly.
+
+### Data plane
+
+Add a fact.
+It lands `Ungrounded`,
+with a confidence the triage step assigns and nothing more.
+The key is `entity.relation`;
+the rest is the value.
+`--ground` names where the truth should be checked,
+but naming a source is not grounding against it,
+so the fact stays `Ungrounded` until a ground check on the control plane confirms it.
+
+```sh
+ken add auth.handler "src/auth/verify_token.rs" \
+    --volatility days \
+    --ground 'src/auth/verify_token.rs#ts:(function_item name:(identifier) @n (#eq? @n "verify_token"))'
+```
+
+Set-valued facts are stored whole and verified in one pass,
+with each element tracked on its own so confirming the list does not smear credit over the one entry you were unsure about:
+
+```sh
+ken add api.public_routes --json routes.json --volatility days \
+    --ground 'src/router.rs#ts:(call function:(_) @f (#match? @f "route"))'
+```
+
+Recall a fact.
+The human form is a small report;
+agents pass `--json`.
+
+```sh
+ken recall auth.handler
+```
+
+```
+auth.handler = src/auth/verify_token.rs
+  confidence   0.71   volatility=days
+  grounded     verified 6h ago · ts-match.ts@a1b2c3
+  due          in 2d
+```
+
+```json
+{
+  "key": "auth.handler",
+  "value": "src/auth/verify_token.rs",
+  "confidence": 0.71,
+  "groundedness": { "state": "verified", "at": "2026-06-06T09:14:00Z",
+                    "verifier": "ts-match.ts@a1b2c3",
+                    "source": "src/auth/verify_token.rs#ts:verify_token @ jj kxnq" },
+  "last_verified": "2026-06-06T09:14:00Z",
+  "due": "2026-06-08T09:14:00Z"
+}
+```
+
+Every recall carries the epistemics.
+A caller that reads `value` and drops the rest has learned the answer without learning whether to trust it,
+which is the one thing this store exists to tell it.
+
+### Inspection
+
+```sh
+ken why auth.handler    # provenance back to the ground sources, with op IDs
+ken search auth         # find facts by entity, relation, text, or groundedness
+ken stale --limit 10    # what is due, ranked by value of information
+ken conflicts           # facts currently holding two answers
+ken log                 # the operation log (this is jj op log underneath)
+ken undo                # roll the store back one operation
+```
+
+`ken why` answers the question a stored fact can never answer about itself.
+Bind a second, independent ground source to `auth.handler` (the wiki, below) and the picture sharpens:
+each source shows by name, and a disagreement between them becomes visible rather than silently averaged away.
+
+```
+auth.handler = src/auth/verify_token.rs
+  ingested   2026-05-02 by mcp/agent:nightly      (confidence 0.40, ungrounded)
+  verified   2026-05-02 ts-match.ts@a1b2c3     -> confirmed  (op 7f3a)
+  verified   2026-06-06 ts-match.ts@a1b2c3     -> confirmed  (op c19d)
+  ground     FILE  src/auth/verify_token.rs  ts:verify_token  @ jj kxnq   (net: none)
+  verified   2026-06-06 wiki-section.ts@d4e5f6 -> refuted    (op e8a0)
+  ground     WIKI  Architecture.md#authentication           @ git 9f12   (net: none)
+  conflict   code says src/auth/verify_token.rs · wiki says src/middleware/auth.ts
+```
+
+That last line is the source-and-wiki drift made into data.
+The code ground and the wiki ground are independent verifiers against independent repositories,
+so when they disagree the fact does not silently pick a winner;
+it holds both answers as a jj conflict and surfaces in `ken conflicts` until something resolves it.
+The disagreement is the signal: the docs are stale, and now you know which way.
+
+### Control plane
+
+```sh
+ken ground auth.handler \
+    --source wiki:Architecture.md#authentication --rev main   # bind an independent ground source
+ken verify auth.handler                                       # force a ground check now
+ken doubt  auth.handler --reason "..."                        # manual override of belief, logged
+ken grant  verifiers/notion-roster.ts --net api.notion.com    # entitle a networked verifier
+```
+
+Grounding a fact and granting a capability are both privilege escalations,
+binding a belief to reality and widening what a verifier may touch,
+so they live here and get logged,
+not buried inside `add`.
+Data-plane ingest may *name* a source as a hint,
+but only the control plane may assert a fact grounded against one.
+
+### Scheduling
+
+`ken` re-checks facts on its own initiative.
+A tick ranks facts by value of information and checks the top of the list under a budget;
+file reads and their predicates run in-process,
+and only a command or generator source spawns a process.
+
+```sh
+ken tick                        # run one scheduler pass now
+ken serve --interval 5m         # run as a resident daemon, one tick per interval
+ken serve --install-launch-agent   # on macOS, register a launch agent for this store
+```
+
+## MCP
+
+`ken mcp` exposes the **data plane only**.
+Agents ingest and recall.
+They cannot ground, verify, override, or grant,
+because an agent ingesting a scraped page over the same credential that can mark facts `Verified` is exactly the confidence laundering the design is built to prevent.
+The interface boundary is the trust boundary.
+
+| tool            | does                                              |
+|-----------------|---------------------------------------------------|
+| `ken_recall`    | value plus full epistemics, same shape as `--json`|
+| `ken_ingest`    | add a fact; always lands `Ungrounded`; returns id |
+| `ken_search`    | find facts by entity, relation, or text           |
+| `ken_conflicts` | list facts currently in conflict                  |
+
+Register it like any MCP server:
+
+```json
+{ "mcpServers": { "ken": { "command": "ken", "args": ["mcp", "--store", "/path/to/project/.ken"] } } }
+```
+
+## Library
+
+`ken` is also a Rust crate,
+for embedding in a larger agent runtime.
+The store is reached through one trait:
+
+```rust
+trait VersionedStore {
+    fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact>;
+    fn apply(&self, op: WriteOp) -> Result<ChangeId>;   // one op = one jj operation
+    fn list_conflicts(&self) -> Result<Vec<ChangeId>>;
+    fn op_log(&self, since: OpId) -> Result<Vec<Operation>>;
+    fn branch_hypothesis(&self, base: Rev) -> Result<Workspace>;
+}
+```
+
+The constructors for the control-plane variants of `WriteOp` are private to the `verify` module,
+so "only a ground check may set groundedness" is a compile-time fact,
+not a convention.
+See `DESIGN.md` for the schema and the rationale.
+
+## Sources and predicates
+
+Checking a fact splits cleanly into two stages: *reading* a source to a span, and *judging* that span.
+Reading is where code and capabilities live; judging is always pure.
+
+A **predicate** is the judge.
+It is declarative and capability-free, evaluated over the claim and the resolved span, and it cannot rot:
+the same span always gives the same verdict, so a refute is unambiguous, the span moved.
+
+```
+exists              the locator resolved to something
+equals[:literal]    span equals the claim (or a literal)
+contains[:literal]  span contains the claim (or a literal)
+matches:<regex>     span matches a regular expression
+num:<op>:<n>         span parses as a number and compares (< <= > >= ==)
+ptr:<pointer>[:<sub>]  resolve an RFC 6901 JSON Pointer, then judge with <sub>
+```
+
+A **source** is the reader, in one of three kinds:
+
+- `File` reads a path at a revision (the default, declarative, every-tick cheap).
+- `Command` runs an allowlisted host program and reads its stdout. HTTP folds in here as `curl`. Only programs in `[command] allow` may run.
+- `Generator` runs a sandboxed Deno script that emits the value on stdout, for the authenticate-fetch-normalize case. Capabilities (`net`, `read`, `env`) are declared and folded into its content hash, so a generator that starts asking for the network shows up as a diff and a `ken grant`. No write-back to the store; hard timeout.
+
+The kinds form a hierarchy, cheapest and most trusted first.
+The same ground can often be expressed in any of them:
+reading `config.toml` is a `File`, or `cat config.toml` as a `Command`, or a generator that calls `Deno.readTextFile`.
+Always use the simplest kind that can express the ground.
+A `File` is deterministic and needs no allowlist or sandbox;
+a `Command` earns its allowlist entry only when a plain read cannot reach the value;
+a `Generator` is the last resort, for grounds that genuinely have to authenticate, page, or normalize.
+Dropping to a more powerful kind costs you determinism, trust, and cadence, so do it only when the kind above cannot do the job.
+
+So "fetch JSON, check a key" needs no code: a `curl` command plus a JSON-pointer predicate.
+
+```sh
+ken ground api.owner \
+    --command 'curl -s https://api.internal/release' \
+    --predicate 'ptr:/owner:equals'
+```
+
+Code is reserved for genuine reading work. A generator authenticates, fetches, and normalizes, then prints the ground value:
+
+```ts
+// verifiers/notion-roster.ts   caps: { net: ["api.notion.com"] }
+const pageId = Deno.env.get("KEN_VALUE")!;
+const body = await (await fetch(`https://api.notion.com/v1/blocks/${pageId}/children`)).json();
+console.log(JSON.stringify({ owner: body.owner ?? null }));   // a pure predicate judges this
+```
+
+A `File` read is deterministic and counts full;
+a `Command` or a net-capable `Generator` is more eclipse-able, so it discounts the Kalman gain and is gated behind value of information,
+which makes "files only" your offline mode and your containment mode at once.
+
+### Schemes
+
+A named source root is a mount.
+`[sources.wiki]` binds the `wiki:` prefix to a place ken reads bytes from,
+addressed by a CURIE (a compact URI): a `scheme:reference` prefix, here `wiki:Architecture`.
+A repo-backed mount points at a separate repository (`repo = "../wiki"`), read through its own VCS.
+A handler-backed mount points at sandboxed code (`handler = "handlers/wiki.ts"`),
+a reusable reader for sources that have to authenticate, page, or normalize.
+
+A handler is the authenticate-fetch-normalize work written once for a whole source instead of once per fact.
+It receives the reference (the CURIE's path) and returns the document;
+ken then applies the locator and the predicate exactly as it would for a file.
+
+```ts
+// handlers/wiki.ts   caps: { net: ["wiki.internal"], env: ["WIKI_TOKEN"] }
+export default {
+  async fetch(reference, env) {
+    const res = await fetch(`https://wiki.internal/page/${reference}`, {
+      headers: { authorization: `Bearer ${env.WIKI_TOKEN}` },
+    });
+    if (!res.ok) throw new Error(`wiki ${reference}: ${res.status}`);
+    return await res.text();   // ken slices the #authentication section, then judges it
+  },
+};
+```
+
+So `ken ground auth.handler --source wiki:Architecture#authentication` reads the wiki through the handler
+and judges the `#authentication` section, the same locator it would use on a local file.
+The symmetry is the addressing and the mount table; the difference is the channel.
+A repo mount is a deterministic file read and counts full.
+A handler mount is code, so it counts at the generator's tier:
+its source and capabilities fold into one content hash, a change in either is a loud diff and a re-ground,
+and a net handler discounts the gain like any non-deterministic channel.
+
+## Configuration
+
+`ken.toml`, in the store root:
+
+```toml
+[budget]
+per_tick = 20          # max verifier runs per scheduler tick
+epsilon  = 0.02        # base audit rate, scaled up by a fact's centrality
+
+[volatility]           # confidence half-life per class
+immutable = "never"
+slow      = "90d"
+days      = "3d"
+hours     = "6h"
+
+[sandbox]              # governs Generator and handler sources
+runtime      = "deno"
+timeout      = "10s"
+default_caps = []      # network-free unless explicitly granted
+
+[command]              # allowlist for Command sources (argv[0]); empty = none
+allow = ["curl", "jq", "git"]
+
+[sources.wiki]         # a mount: the `wiki:` prefix, a separate git repo
+repo = "../wiki"       # repo-backed: read through its own VCS
+vcs  = "git"
+
+[sources.kb]           # handler-backed: sandboxed code resolves the reference
+handler = "handlers/kb.ts"
+net = ["kb.internal"]
+env = ["KB_TOKEN"]     # host vars the handler may read, folded into its hash
+```
+
+A repo-backed mount reads through its VCS:
+the store reads its jj source via `jj file show` and the git wiki via `git show <rev>:<path>`,
+pinned per fact by `--rev`.
+A handler-backed mount runs its code in the sandbox instead and reads stdout.
+The reader differs; the locator grammar does not.
+
+## Storage layout
+
+```
+my-project/
+  .jj/                          the project's own code history
+  .ken/                         the belief store, itself a jj repo
+    .jj/
+    facts/<entity>/<relation>.json   value, epistemics, ground locators, last-seen span hash
+    verifiers/<hash>.ts
+    handlers/<scheme>.ts             reusable scheme handlers (e.g. handlers/wiki.ts)
+    ken.toml
+../wiki/                        a separate git repo, read as a ground source, never written
+  .git/
+  Architecture.md
+```
+
+A fact carries its ground locators and the span hash each one last resolved to;
+the sources themselves stay where they live and `ken` only ever reads them.
+
+## Non-goals
+
+`ken` is not a general knowledge graph or a query endpoint.
+It normalizes the keys it has to traverse (entities and dependency edges) and leaves everything else as loose payload,
+so do not expect SPARQL.
+
+It is not a retrieval index.
+`ken` tracks a bounded set of facts it can verify,
+not a corpus it searches over.
+Point a RAG system at your documents;
+point `ken` at the handful of facts whose staleness would actually cost you something.
+
+It is not a test runner.
+A check over fixed inputs that should always pass is a test, and belongs in your CI.
+`ken` is for claims that were true when written and go stale because the world moves underneath them:
+a staging URL, a release owner, the file a function lives in.
+The judge is a pure predicate for that reason.
+If it ever fails the same way every time, that is a bug in the check, caught once,
+not a fact to re-verify forever.
+The drift `ken` watches for is in the source, never in the judgment.
+
+It is not a truth oracle.
+`ken` reports how much it currently believes a thing and when it last looked.
+Deciding what to do about a stale, low-confidence answer is still your job.
+
+## The name
+
+Jishuken (自主研) is the Toyota practice of *jishu kenkyū*,
+self-directed study:
+a team goes to the actual workplace and examines how the work really happens rather than trusting the report of it.
+The fit is exact.
+The system studies its own knowledge on its own initiative (*jishu*, autonomous),
+it checks claims against the real source instead of a stored summary (the gemba discipline, our ground sources),
+and *ken* (研, and the English "ken") is the range of what is known.
+The command is `ken`.
+The corpus it keeps is your lore.
+The engine underneath is jujutsu.
