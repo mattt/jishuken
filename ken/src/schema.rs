@@ -379,28 +379,39 @@ pub enum GroundSource {
     Handler(HandlerSource),
 }
 
+/// Channel trust weights (DESIGN §6a point 2): how much a confirmation read over
+/// each channel counts. A local file read is deterministic and un-eclipse-able
+/// (full weight); a command or net-capable generator is attacker-influenceable,
+/// so its gain is discounted.
+const WEIGHT_FILE: f64 = 1.0;
+const WEIGHT_COMMAND: f64 = 0.7;
+const WEIGHT_NET: f64 = 0.5;
+const WEIGHT_LOCAL_GENERATOR: f64 = 0.9;
+
+/// Per-read `VoI` costs: a file read is cheap; a command spawns a host process.
+/// Generators and handlers carry their own `cost_estimate` instead.
+const COST_FILE: f64 = 1.0;
+const COST_COMMAND: f64 = 5.0;
+
+/// The channel weight for a generator/handler, by whether it holds `net`.
+fn weight_for_net(is_net: bool) -> f64 {
+    if is_net {
+        WEIGHT_NET
+    } else {
+        WEIGHT_LOCAL_GENERATOR
+    }
+}
+
 impl GroundSource {
     /// Trust weight of the channel (DESIGN §6a point 2): a local file read is
     /// deterministic and un-eclipse-able, so it counts full; a command or a
     /// net-capable generator is more eclipse-able, so it discounts the gain.
     pub fn channel_weight(&self) -> f64 {
         match self {
-            GroundSource::File(_) => 1.0,
-            GroundSource::Command(_) => 0.7,
-            GroundSource::Generator(g) => {
-                if g.is_net() {
-                    0.5
-                } else {
-                    0.9
-                }
-            }
-            GroundSource::Handler(h) => {
-                if h.handler.is_net() {
-                    0.5
-                } else {
-                    0.9
-                }
-            }
+            GroundSource::File(_) => WEIGHT_FILE,
+            GroundSource::Command(_) => WEIGHT_COMMAND,
+            GroundSource::Generator(g) => weight_for_net(g.is_net()),
+            GroundSource::Handler(h) => weight_for_net(h.handler.is_net()),
         }
     }
 
@@ -419,8 +430,8 @@ impl GroundSource {
     /// spawns a process.
     pub fn cost(&self) -> f64 {
         match self {
-            GroundSource::File(_) => 1.0,
-            GroundSource::Command(_) => 5.0,
+            GroundSource::File(_) => COST_FILE,
+            GroundSource::Command(_) => COST_COMMAND,
             GroundSource::Generator(g) => g.cost_estimate,
             GroundSource::Handler(h) => h.handler.cost_estimate,
         }

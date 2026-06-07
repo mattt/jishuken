@@ -37,6 +37,10 @@ pub use crate::schema::Outcome;
 /// assert certainty; only a ground check can move confidence above this.
 pub const INGEST_CONFIDENCE_CEILING: f64 = 0.5;
 
+/// Confidence a bare ingest (neither LLM-scored nor manual) lands at: a weak
+/// prior, well under the ceiling, pending its first ground check.
+const INGEST_DEFAULT_CONFIDENCE: f64 = 0.4;
+
 /// Every mutation of the store. Each becomes one tagged jj operation.
 #[derive(Debug, Clone)]
 pub enum WriteOp {
@@ -136,7 +140,7 @@ impl WriteOp {
 pub fn landed_confidence(triage: &TriageSource) -> f64 {
     let requested = match triage {
         TriageSource::Llm { meta_confidence } => *meta_confidence,
-        TriageSource::Ingest => 0.4,
+        TriageSource::Ingest => INGEST_DEFAULT_CONFIDENCE,
         TriageSource::Manual => INGEST_CONFIDENCE_CEILING,
     };
     requested.clamp(0.0, INGEST_CONFIDENCE_CEILING)

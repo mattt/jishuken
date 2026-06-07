@@ -125,14 +125,14 @@ fn diff_set(value: &FactValue, span: &str) -> Option<Vec<Element>> {
             Some(existing) => {
                 let mut e = existing.clone();
                 e.seen = now;
-                e.confidence = Some(bump(e.confidence.unwrap_or(0.5)));
+                e.confidence = Some(bump(e.confidence.unwrap_or(ELEMENT_PRIOR)));
                 e.conflict = None;
                 merged.push(e);
             }
             None => merged.push(Element {
                 value: rv.clone(),
                 seen: now,
-                confidence: Some(0.6),
+                confidence: Some(NEW_ELEMENT_CONFIDENCE),
                 conflict: None,
             }),
         }
@@ -140,8 +140,16 @@ fn diff_set(value: &FactValue, span: &str) -> Option<Vec<Element>> {
     Some(merged)
 }
 
+/// Confidence assumed for a re-appearing set element that carries none yet.
+const ELEMENT_PRIOR: f64 = 0.5;
+/// Confidence assigned to a set element observed for the first time.
+const NEW_ELEMENT_CONFIDENCE: f64 = 0.6;
+/// Fraction of the gap to certainty a re-confirmation closes for an element.
+const ELEMENT_BUMP: f64 = 0.3;
+
+/// Move an element's confidence a fixed fraction toward certainty on re-confirm.
 fn bump(prior: f64) -> f64 {
-    (prior + 0.3 * (1.0 - prior)).clamp(0.0, 1.0)
+    (prior + ELEMENT_BUMP * (1.0 - prior)).clamp(0.0, 1.0)
 }
 
 /// Bind a ground to a fact (`ken ground`), then check it once. Control-plane
