@@ -214,7 +214,6 @@ pub fn tick(store: &JjStore) -> Result<Vec<(String, Groundedness)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     fn set(values: &[&str]) -> FactValue {
         FactValue::Set {

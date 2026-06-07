@@ -15,7 +15,10 @@ use crate::config::Config;
 use crate::decay::{decayed_variance, kalman_update};
 use crate::error::{Error, Result};
 use crate::ground::generator::GeneratorRegistry;
-use crate::schema::*;
+use crate::schema::{
+    path_for, ChangeId, Claim, Epistemics, Fact, FactValue, GeneratorHash, GroundBinding,
+    GroundSource, Groundedness, Provenance, ScheduleMeta, SourceRef, SourceRoot, Timestamp,
+};
 use crate::write::{landed_confidence, Outcome, WriteOp};
 
 /// Which revision to read at. `@` is the working copy.
@@ -67,6 +70,7 @@ const INGEST_VARIANCE: f64 = 0.25;
 const US: char = '\u{1f}';
 const RS: char = '\u{1e}';
 
+#[derive(Debug)]
 pub struct JjStore {
     root: PathBuf,
     config: Config,
@@ -237,7 +241,7 @@ impl JjStore {
 
     /// The tagged change descriptions (`[Ingest] …`, `[GroundCheck:confirmed] …`),
     /// newest first. This is where each [`WriteOp`]'s variant is recorded, so the
-    /// audit "groundedness only ever moved via GroundCheck" is greppable here.
+    /// audit "groundedness only ever moved via `GroundCheck`" is greppable here.
     pub fn change_log(&self) -> Result<Vec<Operation>> {
         let template = format!(
             "change_id.short() ++ \"{US}\" ++ committer.timestamp() ++ \"{US}\" ++ description ++ \"{RS}\""
@@ -380,7 +384,7 @@ impl VersionedStore for JjStore {
             } => {
                 let mut fact = self.read_fact(&id, Rev::Working)?;
                 let now = Utc::now();
-                let net = fact.grounds.get(ground).is_some_and(|g| g.is_net());
+                let net = fact.grounds.get(ground).is_some_and(GroundBinding::is_net);
 
                 // Record the replay state on the ground that was checked.
                 if let (Some(g), Some(r)) = (fact.grounds.get_mut(ground), resolved.clone()) {
@@ -412,7 +416,7 @@ impl VersionedStore for JjStore {
                 self.recompute_centrality()?;
                 let by = resolved
                     .as_ref()
-                    .and_then(|r| r.by.as_ref().map(|h| h.to_string()))
+                    .and_then(|r| r.by.as_ref().map(ToString::to_string))
                     .unwrap_or_else(|| "existence".to_string());
                 self.commit(&tag, &format!("{} #{ground} {by}", fact.claim.key()))?;
                 Ok(id)

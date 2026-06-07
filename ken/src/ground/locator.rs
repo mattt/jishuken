@@ -32,7 +32,7 @@ pub fn parse_source(input: &str, rev: Option<String>) -> Result<(SourceRef, Loca
 
     // Leading `<root>:` named-root prefix. A bare identifier followed by `:`
     // and not `//` (networked schemes are deferred).
-    let (root, rest) = split_root(body)?;
+    let (root, rest) = split_root(body);
 
     // `?q=` quote locator.
     if let Some((path, q)) = rest.split_once("?q=") {
@@ -70,7 +70,7 @@ fn source_ref(root: SourceRoot, path: &str, rev: Option<String>) -> SourceRef {
     }
 }
 
-fn split_root(body: &str) -> Result<(SourceRoot, &str)> {
+fn split_root(body: &str) -> (SourceRoot, &str) {
     // A named root is `<ident>:` where ident is [a-z0-9_-]+ and the next char
     // is not `/` (so `https://` stays a path, networked deferred).
     if let Some(colon) = body.find(':') {
@@ -86,10 +86,10 @@ fn split_root(body: &str) -> Result<(SourceRoot, &str)> {
                 "project" => SourceRoot::Project,
                 other => SourceRoot::Named(other.to_string()),
             };
-            return Ok((root, rest));
+            return (root, rest);
         }
     }
-    Ok((SourceRoot::Project, body))
+    (SourceRoot::Project, body)
 }
 
 fn is_line_range(frag: &str) -> bool {

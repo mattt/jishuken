@@ -73,6 +73,7 @@ impl GeneratorSrc {
 }
 
 /// On-disk store of generator sources under `verifiers/`.
+#[derive(Debug)]
 pub struct GeneratorRegistry {
     root: PathBuf,
 }
@@ -102,10 +103,10 @@ impl GeneratorRegistry {
     pub fn load_src(path: &Path, caps: Capabilities) -> Result<GeneratorSrc> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| Error::Verifier(format!("reading {}: {e}", path.display())))?;
-        let name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "generator.ts".to_string());
+        let name = path.file_name().map_or_else(
+            || "generator.ts".to_string(),
+            |s| s.to_string_lossy().to_string(),
+        );
         Ok(GeneratorSrc::new(name, source, caps))
     }
 
@@ -159,6 +160,7 @@ impl GeneratorRun {
 
 /// Capability-scoped Deno runner. Declared capabilities become sandbox flags;
 /// nothing more is granted; a hard timeout always applies; no write-back.
+#[derive(Debug)]
 pub struct Sandbox {
     runtime: String,
     timeout: Duration,
@@ -223,12 +225,9 @@ impl Sandbox {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = std::fs::remove_file(&script);
-                return errored(hash_changed);
-            }
+        let Ok(mut child) = cmd.spawn() else {
+            let _ = std::fs::remove_file(&script);
+            return errored(hash_changed);
         };
 
         let start = Instant::now();
@@ -339,13 +338,10 @@ impl Sandbox {
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                let _ = std::fs::remove_file(&module);
-                let _ = std::fs::remove_file(&entry);
-                return errored(hash_changed);
-            }
+        let Ok(mut child) = cmd.spawn() else {
+            let _ = std::fs::remove_file(&module);
+            let _ = std::fs::remove_file(&entry);
+            return errored(hash_changed);
         };
 
         let start = Instant::now();
@@ -387,7 +383,7 @@ impl Sandbox {
 /// Build a `--allow-env` flag from a fixed set of ken-injected names plus the
 /// declared `env` capability (e.g. an auth token a handler needs).
 fn allow_env(base: &[&str], caps_env: &[String]) -> String {
-    let mut names: Vec<String> = base.iter().map(|s| s.to_string()).collect();
+    let mut names: Vec<String> = base.iter().map(|&s| s.to_string()).collect();
     names.extend(caps_env.iter().cloned());
     format!("--allow-env={}", names.join(","))
 }

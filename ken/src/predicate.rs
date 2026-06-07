@@ -18,7 +18,7 @@ pub enum NumOp {
 }
 
 impl NumOp {
-    fn apply(&self, lhs: f64, rhs: f64) -> bool {
+    fn apply(self, lhs: f64, rhs: f64) -> bool {
         match self {
             NumOp::Lt => lhs < rhs,
             NumOp::Le => lhs <= rhs,
@@ -129,10 +129,10 @@ impl Predicate {
         let p = match head {
             "exists" => Predicate::Exists,
             "equals" => Predicate::Equals {
-                literal: rest.map(|s| s.to_string()),
+                literal: rest.map(String::from),
             },
             "contains" => Predicate::Contains {
-                literal: rest.map(|s| s.to_string()),
+                literal: rest.map(String::from),
             },
             "matches" => Predicate::Matches {
                 regex: rest

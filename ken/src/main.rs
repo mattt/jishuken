@@ -283,7 +283,6 @@ fn open_store(cli: &Cli) -> anyhow::Result<JjStore> {
     Ok(JjStore::discover(cli.store.as_deref(), &cwd)?)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_add(
     store: &JjStore,
     key: String,
@@ -361,7 +360,6 @@ fn source_to_ground(store: &JjStore, src: SourceRef) -> anyhow::Result<GroundSou
     )?)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_ground(
     store: &JjStore,
     key: &str,
@@ -378,7 +376,7 @@ fn cmd_ground(
             (source_to_ground(store, src)?, locator)
         }
         (None, Some(cmd), None) => {
-            let argv: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+            let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
             if argv.is_empty() {
                 anyhow::bail!("--command is empty");
             }
@@ -494,10 +492,9 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
 
     // Each ground: source, kind, predicate, span-hash prefix, last outcome.
     for g in &fact.grounds {
-        let span = g
-            .last
-            .as_ref()
-            .map(|r| {
+        let span = g.last.as_ref().map_or_else(
+            || "  unchecked".to_string(),
+            |r| {
                 if r.span_hash.is_empty() {
                     format!("  {}", r.outcome.label())
                 } else {
@@ -507,8 +504,8 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
                         r.outcome.label()
                     )
                 }
-            })
-            .unwrap_or_else(|| "  unchecked".to_string());
+            },
+        );
         println!(
             "  ground     {}  {}  [{}]{}",
             g.source.kind_label(),
@@ -547,7 +544,10 @@ fn cmd_stale(store: &JjStore, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the clap subcommand fields"
+)]
 fn cmd_search(
     store: &JjStore,
     query: &str,

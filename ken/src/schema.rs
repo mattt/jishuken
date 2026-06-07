@@ -411,7 +411,7 @@ impl GroundSource {
         }
     }
 
-    /// Per-read cost for VoI: a file read is cheap; a command or generator
+    /// Per-read cost for `VoI`: a file read is cheap; a command or generator
     /// spawns a process.
     pub fn cost(&self) -> f64 {
         match self {
@@ -480,7 +480,7 @@ impl GroundBinding {
         self.source.is_net()
     }
 
-    /// Per-check cost for VoI: a file read is cheap, a command/generator spawns.
+    /// Per-check cost for `VoI`: a file read is cheap, a command/generator spawns.
     pub fn cost(&self) -> f64 {
         self.source.cost()
     }
@@ -512,12 +512,12 @@ impl Fact {
         !self.grounds.is_empty()
     }
 
-    /// Cheapest ground check, for VoI ranking. `None` if unchecked-able.
+    /// Cheapest ground check, for `VoI` ranking. `None` if unchecked-able.
     pub fn min_check_cost(&self) -> Option<f64> {
         self.grounds
             .iter()
-            .map(|g| g.cost())
-            .min_by(|a, b| a.total_cmp(b))
+            .map(GroundBinding::cost)
+            .min_by(f64::total_cmp)
     }
 }
 

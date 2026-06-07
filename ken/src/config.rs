@@ -294,7 +294,7 @@ default_caps = []
     fn durations() {
         assert_eq!(parse_duration_secs("never"), None);
         assert_eq!(parse_duration_secs("6h"), Some(21600.0));
-        assert_eq!(parse_duration_secs("90d"), Some(7776000.0));
+        assert_eq!(parse_duration_secs("90d"), Some(7_776_000.0));
         assert_eq!(parse_duration_secs("30m"), Some(1800.0));
     }
 

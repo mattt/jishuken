@@ -20,3 +20,43 @@ toml = "0.8"
 regex = "1"
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "io-std", "time"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+# Selected restriction-group lints, for consistency and to force reasons.
+allow_attributes_without_reason = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+empty_structs_with_brackets = "warn"
+if_then_some_else_none = "warn"
+unused_result_ok = "warn"
+# Project opt-outs: pedantic lints whose churn outweighs their value here.
+# Getters/labels are not an API-misuse risk in a binary-plus-library.
+must_use_candidate = "allow"
+# Whole-second and duration arithmetic; sub-second precision is irrelevant.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+# Tests assert on exactly-representable f64 constants.
+float_cmp = "allow"
+# CLI flag groups and process-run results read clearest as flat bools.
+struct_excessive_bools = "allow"
+# Graph and Kalman math mirror their single-letter notation.
+many_single_char_names = "allow"
+# CLI handlers take owned, clap-parsed arguments.
+needless_pass_by_value = "allow"
+# The store's `apply` is one cohesive per-variant dispatch.
+too_many_lines = "allow"

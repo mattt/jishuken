@@ -270,8 +270,7 @@ fn run_command(argv: &[String], root: &Path, timeout_secs: f64) -> Result<String
             "command exited with {}",
             status
                 .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into())
+                .map_or_else(|| "signal".into(), |c| c.to_string())
         )));
     }
     Ok(out)

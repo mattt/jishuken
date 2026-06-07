@@ -27,7 +27,7 @@ pub fn audit_probability(f: &Fact, cfg: &Config) -> f64 {
     (cfg.budget.epsilon * f.schedule.centrality).clamp(0.0, 1.0)
 }
 
-/// Facts ranked by descending VoI.
+/// Facts ranked by descending `VoI`.
 pub fn rank<'a>(facts: &'a [Fact], now: Timestamp, cfg: &Config) -> Vec<&'a Fact> {
     let mut scored: Vec<(&Fact, f64)> = facts.iter().map(|f| (f, voi_score(f, now, cfg))).collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));

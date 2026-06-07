@@ -73,7 +73,6 @@ pub fn kalman_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use crate::schema::*;
     use chrono::{Duration, Utc};
 
