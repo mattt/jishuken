@@ -266,13 +266,28 @@ Agents ingest and recall.
 They cannot ground, verify, override, or grant,
 because an agent ingesting a scraped page over the same credential that can mark facts `Verified` is exactly the confidence laundering the design is built to prevent.
 The interface boundary is the trust boundary.
+The server's `instructions` carry that discipline to the agent:
+read groundedness before trusting a value,
+and an `Ungrounded` fact is a guess no matter how confident.
 
-| tool            | does                                              |
-|-----------------|---------------------------------------------------|
-| `ken_recall`    | value plus full epistemics, same shape as `--json`|
-| `ken_ingest`    | add a fact; always lands `Ungrounded`; returns id |
-| `ken_search`    | find facts by entity, relation, or text           |
-| `ken_conflicts` | list facts currently in conflict                  |
+| tool            | does                                                       |
+|-----------------|------------------------------------------------------------|
+| `ken_recall`    | value plus full epistemics (structured output, same shape as `--json`) |
+| `ken_ingest`    | add a fact; always lands `Ungrounded`; takes a `ground` hint; returns id |
+| `ken_search`    | find facts by entity, relation, or text; links each match to its fact resource |
+| `ken_conflicts` | list facts currently in conflict                           |
+
+The read surface is also addressable as resources,
+so a fact can be fetched or attached as context without a tool call:
+`ken://fact/<entity.relation>` is a fact with full epistemics,
+`ken://why/<entity.relation>` is its provenance,
+`ken://conflicts` lists the facts holding two answers,
+and `ken://stale` ranks the facts most worth re-checking.
+Two prompts ship the conventions:
+`remember` extracts durable, verifiable facts from context and ingests them with a ground hint,
+and `check-memory` recalls what the store knows and weighs it by groundedness before acting.
+Completion suggests the keys actually in the store.
+Every surface stays on the data plane; none of it can ground, verify, override, or grant.
 
 Register it like any MCP server:
 
