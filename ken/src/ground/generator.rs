@@ -209,7 +209,7 @@ impl Sandbox {
         let hash_changed = recorded_hash.is_some_and(|h| *h != current);
 
         let dir = std::env::temp_dir();
-        let stem = &current.0[..16];
+        let stem = unique_stem(&current.0[..16]);
         let script = dir.join(format!("ken-gen-{stem}.ts"));
         let stdout_path = dir.join(format!("ken-gen-out-{stem}.log"));
         let stderr_path = dir.join(format!("ken-gen-err-{stem}.log"));
@@ -237,7 +237,7 @@ impl Sandbox {
         let current = src.hash();
         let hash_changed = recorded_hash.is_some_and(|h| *h != current);
 
-        let stem = &current.0[..16];
+        let stem = unique_stem(&current.0[..16]);
         let dir = std::env::temp_dir();
         let module = dir.join(format!("ken-handler-{stem}.ts"));
         let entry = dir.join(format!("ken-handler-entry-{stem}.ts"));
@@ -376,6 +376,14 @@ fn allow_env(base: &[&str], caps_env: &[String]) -> String {
     let mut names: Vec<String> = base.iter().map(|&s| s.to_string()).collect();
     names.extend(caps_env.iter().cloned());
     format!("--allow-env={}", names.join(","))
+}
+
+/// A process- and run-unique temp file stem, so concurrent sandbox runs of the
+/// same generator never share (and clean up via `cleanup()`) each other's files.
+fn unique_stem(hash_prefix: &str) -> String {
+    static RUN_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RUN_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{hash_prefix}-{}-{n}", std::process::id())
 }
 
 fn errored(hash_changed: bool) -> GeneratorRun {
