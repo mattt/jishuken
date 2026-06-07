@@ -13,6 +13,7 @@ pub mod ground;
 pub mod predicate;
 pub mod scheduler;
 pub mod schema;
+pub mod sketch;
 pub mod store;
 pub mod verify;
 pub mod write;
