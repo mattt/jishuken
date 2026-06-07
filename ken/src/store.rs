@@ -304,26 +304,10 @@ impl JjStore {
             "change_id.short() ++ \"{US}\" ++ committer.timestamp() ++ \"{US}\" ++ description ++ \"{RS}\""
         );
         let out = self.jj(&["log", "-r", "::@", "--no-graph", "-T", &template])?;
-        let mut entries = Vec::new();
-        for record in out.split(RS) {
-            let record = record.trim_matches(|c: char| c == '\n' || c == '\r');
-            if record.is_empty() {
-                continue;
-            }
-            let mut parts = record.splitn(3, US);
-            let id = parts.next().unwrap_or("").trim().to_string();
-            let time = parts.next().unwrap_or("").trim().to_string();
-            let description = parts.next().unwrap_or("").trim().to_string();
-            if description.is_empty() {
-                continue;
-            }
-            entries.push(Operation {
-                id,
-                time,
-                description,
-            });
-        }
-        Ok(entries)
+        Ok(parse_log_records(&out)
+            .into_iter()
+            .filter(|o| !o.description.is_empty())
+            .collect())
     }
 
     /// Recompute trust-weighted centrality (DESIGN §9) over a fact→entity graph:
@@ -530,25 +514,13 @@ impl VersionedStore for JjStore {
         );
         let out = self.jj(&["op", "log", "--no-graph", "-T", &template])?;
         let mut ops = Vec::new();
-        for record in out.split('\u{1e}') {
-            let record = record.trim_matches(|c: char| c == '\n' || c == '\r');
-            if record.is_empty() {
-                continue;
-            }
-            let mut parts = record.splitn(3, '\u{1f}');
-            let id = parts.next().unwrap_or("").trim().to_string();
-            let time = parts.next().unwrap_or("").trim().to_string();
-            let description = parts.next().unwrap_or("").trim().to_string();
+        for op in parse_log_records(&out) {
             if let Some(OpId(stop)) = &since {
-                if &id == stop {
+                if &op.id == stop {
                     break;
                 }
             }
-            ops.push(Operation {
-                id,
-                time,
-                description,
-            });
+            ops.push(op);
         }
         Ok(ops)
     }
@@ -605,6 +577,24 @@ fn aggregate_groundedness(fact: &Fact) -> Groundedness {
             Groundedness::Verified { at, by }
         }
     }
+}
+
+/// Parse the US/RS-delimited jj log template output into operations, one per
+/// non-empty record. Callers apply their own filtering (empty descriptions,
+/// `since` truncation).
+fn parse_log_records(out: &str) -> Vec<Operation> {
+    out.split(RS)
+        .map(|record| record.trim_matches(|c: char| c == '\n' || c == '\r'))
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let mut parts = record.splitn(3, US);
+            Operation {
+                id: parts.next().unwrap_or("").trim().to_string(),
+                time: parts.next().unwrap_or("").trim().to_string(),
+                description: parts.next().unwrap_or("").trim().to_string(),
+            }
+        })
+        .collect()
 }
 
 fn run_jj_in(dir: &Path, args: &[&str]) -> Result<String> {

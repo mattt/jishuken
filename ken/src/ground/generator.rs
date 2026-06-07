@@ -208,73 +208,18 @@ impl Sandbox {
         let current = src.hash();
         let hash_changed = recorded_hash.is_some_and(|h| *h != current);
 
-        let script = std::env::temp_dir().join(format!("ken-gen-{}.ts", &current.0[..16]));
-        let stderr_path =
-            std::env::temp_dir().join(format!("ken-gen-err-{}.log", &current.0[..16]));
-        let stdout_path =
-            std::env::temp_dir().join(format!("ken-gen-out-{}.log", &current.0[..16]));
+        let dir = std::env::temp_dir();
+        let stem = &current.0[..16];
+        let script = dir.join(format!("ken-gen-{stem}.ts"));
+        let stdout_path = dir.join(format!("ken-gen-out-{stem}.log"));
+        let stderr_path = dir.join(format!("ken-gen-err-{stem}.log"));
         if std::fs::write(&script, &src.source).is_err() {
             return errored(hash_changed);
         }
-        let (Ok(stderr_file), Ok(stdout_file)) = (
-            std::fs::File::create(&stderr_path),
-            std::fs::File::create(&stdout_path),
-        ) else {
-            return errored(hash_changed);
-        };
 
-        let mut cmd = Command::new(&self.runtime);
-        cmd.arg("run").arg("--no-prompt").arg("--quiet");
-        cmd.arg(allow_env(&["KEN_VALUE"], &src.caps.env));
-        if !src.caps.net.is_empty() {
-            cmd.arg(format!("--allow-net={}", src.caps.net.join(",")));
-        }
-        if !src.caps.read.is_empty() {
-            cmd.arg(format!("--allow-read={}", src.caps.read.join(",")));
-        }
-        cmd.arg(&script)
-            .env("KEN_VALUE", claim)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
-
-        let Ok(mut child) = cmd.spawn() else {
-            let _ = std::fs::remove_file(&script);
-            return errored(hash_changed);
-        };
-
-        let start = Instant::now();
-        let (timed_out, exit_code) = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break (false, status.code()),
-                Ok(None) => {
-                    if start.elapsed() >= self.timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break (true, None);
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-                Err(_) => break (false, None),
-            }
-        };
-
-        let stderr_nonempty = std::fs::metadata(&stderr_path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false);
-        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&script);
-        let _ = std::fs::remove_file(&stderr_path);
-        let _ = std::fs::remove_file(&stdout_path);
-
-        GeneratorRun {
-            spawned: true,
-            timed_out,
-            exit_code,
-            stderr_nonempty,
-            hash_changed,
-            stdout,
-        }
+        let mut cmd = self.deno_run(&src.caps, allow_env(&["KEN_VALUE"], &src.caps.env));
+        cmd.arg(&script).env("KEN_VALUE", claim);
+        self.spawn_and_collect(cmd, hash_changed, &stdout_path, &stderr_path, &[&script])
     }
 
     /// Run a scheme handler: a generated bootstrap imports the handler module's
@@ -326,34 +271,69 @@ impl Sandbox {
             let _ = std::fs::remove_file(&module);
             return errored(hash_changed);
         }
-        let (Ok(stderr_file), Ok(stdout_file)) = (
-            std::fs::File::create(&stderr_path),
-            std::fs::File::create(&stdout_path),
-        ) else {
-            let _ = std::fs::remove_file(&module);
-            let _ = std::fs::remove_file(&entry);
-            return errored(hash_changed);
-        };
 
-        let mut cmd = Command::new(&self.runtime);
-        cmd.arg("run").arg("--no-prompt").arg("--quiet");
-        cmd.arg(allow_env(&["KEN_REF", "KEN_REV"], &src.caps.env));
-        if !src.caps.net.is_empty() {
-            cmd.arg(format!("--allow-net={}", src.caps.net.join(",")));
-        }
-        if !src.caps.read.is_empty() {
-            cmd.arg(format!("--allow-read={}", src.caps.read.join(",")));
-        }
+        let mut cmd = self.deno_run(&src.caps, allow_env(&["KEN_REF", "KEN_REV"], &src.caps.env));
         cmd.arg(&entry)
             .env("KEN_REF", reference)
-            .env("KEN_REV", rev.unwrap_or(""))
-            .stdin(Stdio::null())
+            .env("KEN_REV", rev.unwrap_or(""));
+        self.spawn_and_collect(
+            cmd,
+            hash_changed,
+            &stdout_path,
+            &stderr_path,
+            &[&module, &entry],
+        )
+    }
+
+    /// Build a `deno run` command with the standard sandbox flags and the
+    /// capability allowlists folded into the content hash (DESIGN §6a).
+    fn deno_run(&self, caps: &Capabilities, env_flag: String) -> Command {
+        let mut cmd = Command::new(&self.runtime);
+        cmd.arg("run")
+            .arg("--no-prompt")
+            .arg("--quiet")
+            .arg(env_flag);
+        if !caps.net.is_empty() {
+            cmd.arg(format!("--allow-net={}", caps.net.join(",")));
+        }
+        if !caps.read.is_empty() {
+            cmd.arg(format!("--allow-read={}", caps.read.join(",")));
+        }
+        cmd
+    }
+
+    /// Spawn `cmd` under the hard timeout, capture stdout/stderr to the given
+    /// paths, clean up the temp `inputs` (plus the capture files), and report
+    /// the run. A spawn or capture-file failure is reported as `errored`.
+    fn spawn_and_collect(
+        &self,
+        mut cmd: Command,
+        hash_changed: bool,
+        stdout_path: &Path,
+        stderr_path: &Path,
+        inputs: &[&Path],
+    ) -> GeneratorRun {
+        let cleanup = || {
+            for p in inputs {
+                let _ = std::fs::remove_file(p);
+            }
+            let _ = std::fs::remove_file(stdout_path);
+            let _ = std::fs::remove_file(stderr_path);
+        };
+
+        let (Ok(stdout_file), Ok(stderr_file)) = (
+            std::fs::File::create(stdout_path),
+            std::fs::File::create(stderr_path),
+        ) else {
+            cleanup();
+            return errored(hash_changed);
+        };
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
 
         let Ok(mut child) = cmd.spawn() else {
-            let _ = std::fs::remove_file(&module);
-            let _ = std::fs::remove_file(&entry);
+            cleanup();
             return errored(hash_changed);
         };
 
@@ -373,14 +353,11 @@ impl Sandbox {
             }
         };
 
-        let stderr_nonempty = std::fs::metadata(&stderr_path)
+        let stderr_nonempty = std::fs::metadata(stderr_path)
             .map(|m| m.len() > 0)
             .unwrap_or(false);
-        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-        let _ = std::fs::remove_file(&module);
-        let _ = std::fs::remove_file(&entry);
-        let _ = std::fs::remove_file(&stderr_path);
-        let _ = std::fs::remove_file(&stdout_path);
+        let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
+        cleanup();
 
         GeneratorRun {
             spawned: true,
