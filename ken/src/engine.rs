@@ -26,6 +26,10 @@ fn ground_by(binding: &GroundBinding) -> Option<GeneratorHash> {
 
 /// Force a ground check on a fact now (`ken verify`): check every ground, apply
 /// one `GroundCheck` op per ground, then return the resulting groundedness.
+///
+/// # Errors
+/// Returns an error if the fact is unknown, has no grounds bound, or a store
+/// read or write fails.
 pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
     if fact.grounds.is_empty() {
@@ -52,6 +56,10 @@ pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
 /// Read one ground and judge it with its predicate. Returns the outcome, the
 /// resolved replay state, and (for set facts) the merged element list. No
 /// judging code runs in a sandbox; reading may spawn, judging never does.
+///
+/// # Errors
+/// Currently infallible; the `Result` mirrors the `GroundCheck` op it feeds, as
+/// source-read failures are reported as an [`Outcome`] rather than an error.
 pub fn check_ground(
     store: &JjStore,
     fact: &Fact,
@@ -138,6 +146,9 @@ fn bump(prior: f64) -> f64 {
 
 /// Bind a ground to a fact (`ken ground`), then check it once. Control-plane
 /// only. The CLI builds the binding (source + locator + predicate).
+///
+/// # Errors
+/// Returns an error if the fact is unknown or a store read or write fails.
 pub fn ground(store: &JjStore, key: &str, binding: GroundBinding) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
     let id = ChangeId::for_claim(&fact.claim);
@@ -156,6 +167,10 @@ pub fn ground(store: &JjStore, key: &str, binding: GroundBinding) -> Result<Grou
 /// Entitle a generator with new capabilities (`ken grant`). Re-registers the
 /// source (changing its content hash, DESIGN §6a) and re-points the Generator
 /// grounds that use it.
+///
+/// # Errors
+/// Returns an error if the generator source cannot be read or re-registered, or
+/// a store read or write fails.
 pub fn grant(
     store: &JjStore,
     generator_path: &std::path::Path,
@@ -195,6 +210,9 @@ pub fn grant(
 
 /// One scheduler tick (DESIGN §7): check the top facts under budget. Returns the
 /// keys checked and their resulting groundedness.
+///
+/// # Errors
+/// Returns an error if listing the store's facts fails.
 pub fn tick(store: &JjStore) -> Result<Vec<(String, Groundedness)>> {
     let now = Utc::now();
     let facts = store.all_facts()?;

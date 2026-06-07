@@ -86,6 +86,9 @@ impl GeneratorRegistry {
     }
 
     /// Persist a generator and return its content-addressed reference.
+    ///
+    /// # Errors
+    /// Returns an error if the source or its metadata cannot be written.
     pub fn put(&self, src: &GeneratorSrc) -> Result<GeneratorRef> {
         let r = src.to_ref();
         let path = self.root.join(&r.src_path);
@@ -100,6 +103,9 @@ impl GeneratorRegistry {
 
     /// Load a generator source from an on-disk `.ts` path. Capabilities default
     /// to network-free.
+    ///
+    /// # Errors
+    /// Returns an error if `path` cannot be read.
     pub fn load_src(path: &Path, caps: Capabilities) -> Result<GeneratorSrc> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| Error::Verifier(format!("reading {}: {e}", path.display())))?;
@@ -110,6 +116,10 @@ impl GeneratorRegistry {
         Ok(GeneratorSrc::new(name, source, caps))
     }
 
+    /// Read a registered generator's source text.
+    ///
+    /// # Errors
+    /// Returns an error if the source file cannot be read.
     pub fn read_source(&self, r: &GeneratorRef) -> Result<String> {
         Ok(std::fs::read_to_string(self.root.join(&r.src_path))?)
     }
@@ -120,6 +130,9 @@ impl GeneratorRegistry {
 /// return both the runnable source and its content-addressed reference. The
 /// hash covers source AND capabilities, so any drift in either is a loud diff
 /// (DESIGN §6a).
+///
+/// # Errors
+/// Returns an error if the handler module cannot be read.
 pub fn load_handler(
     store_root: &Path,
     scheme: &str,

@@ -37,6 +37,9 @@ pub enum ReadResult {
 /// handler-backed in config (a CURIE scheme with `[sources.<scheme>] handler`)
 /// mounts code, capturing the handler's content hash now (DESIGN §6a); any
 /// other root is a plain file read.
+///
+/// # Errors
+/// Returns an error if a handler-backed scheme's module cannot be loaded.
 pub fn ground_source_for(
     config: &Config,
     store_root: &Path,

@@ -53,12 +53,34 @@ pub struct Workspace {
     pub change: String,
 }
 
-/// The store, reached through one trait (README "Library").
+/// The store, reached through one trait (README "Library"). Every method
+/// returns an error if the underlying store cannot be read or written, or (for
+/// historical revisions) the `jj` invocation fails.
 pub trait VersionedStore {
+    /// Read a fact by id at a given revision.
+    ///
+    /// # Errors
+    /// See the trait-level note.
     fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact>;
+    /// Apply one [`WriteOp`], landing it as one tagged jj operation.
+    ///
+    /// # Errors
+    /// See the trait-level note.
     fn apply(&self, op: WriteOp) -> Result<ChangeId>;
+    /// The facts currently in a `Conflicted` state.
+    ///
+    /// # Errors
+    /// See the trait-level note.
     fn list_conflicts(&self) -> Result<Vec<ChangeId>>;
+    /// The operation log, newest first, optionally truncated at `since`.
+    ///
+    /// # Errors
+    /// See the trait-level note.
     fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>>;
+    /// Start an anonymous hypothesis change off `base`.
+    ///
+    /// # Errors
+    /// See the trait-level note.
     fn branch_hypothesis(&self, base: Rev) -> Result<Workspace>;
 }
 
@@ -79,6 +101,9 @@ pub struct JjStore {
 impl JjStore {
     /// Discover the store by walking up from `start` for a `.ken/` directory,
     /// the way jj finds `.jj/`. Honors an explicit override first.
+    ///
+    /// # Errors
+    /// Returns [`Error::StoreNotFound`] if no `.ken/` store is found.
     pub fn discover(explicit: Option<&Path>, start: &Path) -> Result<JjStore> {
         if let Some(p) = explicit {
             return JjStore::open(p);
@@ -94,6 +119,10 @@ impl JjStore {
         Err(Error::StoreNotFound)
     }
 
+    /// Open an existing `.ken/` store at `root`.
+    ///
+    /// # Errors
+    /// Returns [`Error::StoreNotFound`] if `root` is not a jj-backed store.
     pub fn open(root: &Path) -> Result<JjStore> {
         if !root.join(".jj").is_dir() {
             return Err(Error::StoreNotFound);
@@ -118,6 +147,10 @@ impl JjStore {
     }
 
     /// Create a `.ken/` store: a jj repo with `ken.toml`, `facts/`, `verifiers/`.
+    ///
+    /// # Errors
+    /// Returns an error if the directories cannot be created or a `jj`
+    /// invocation fails.
     pub fn init(root: &Path) -> Result<JjStore> {
         std::fs::create_dir_all(root)?;
         // `git init` must not pass `-R` (no repo exists yet to resolve).
@@ -146,6 +179,10 @@ impl JjStore {
     }
 
     /// Read a fact by its `entity.relation` key from the working copy.
+    ///
+    /// # Errors
+    /// Returns an error if the key is malformed, the fact does not exist, or its
+    /// file is not valid JSON.
     pub fn read_fact_by_key(&self, key: &str) -> Result<Fact> {
         let claim = Claim::parse_key(key)?;
         let path = self.fact_path(&claim);
@@ -154,6 +191,9 @@ impl JjStore {
     }
 
     /// All facts currently in the store (scans `facts/`).
+    ///
+    /// # Errors
+    /// Returns an error if the `facts/` directory cannot be read.
     pub fn all_facts(&self) -> Result<Vec<Fact>> {
         let mut out = Vec::new();
         let facts_dir = self.root.join("facts");
@@ -191,6 +231,9 @@ impl JjStore {
 
     /// Persist a fact file without committing. Control-plane callers use this
     /// alongside [`JjStore::control_commit`] to land one tagged op.
+    ///
+    /// # Errors
+    /// Returns an error if the fact file cannot be written.
     pub fn put_fact(&self, fact: &Fact) -> Result<()> {
         self.write_fact(fact)
     }
@@ -203,6 +246,9 @@ impl JjStore {
     }
 
     /// Control-plane tagged commit (e.g. `Grant`), one loud logged operation.
+    ///
+    /// # Errors
+    /// Returns an error if the `jj commit` invocation fails.
     pub fn control_commit(&self, tag: &str, detail: &str) -> Result<()> {
         self.commit(tag, detail)
     }
@@ -223,6 +269,11 @@ impl JjStore {
         Ok(())
     }
 
+    /// The logged calibration samples, or an empty list if none exist yet.
+    ///
+    /// # Errors
+    /// Currently infallible; returns `Result` for symmetry with the other
+    /// store readers.
     pub fn calibration_samples(&self) -> Result<Vec<CalibrationSample>> {
         let path = self.root.join("calibration.jsonl");
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -235,6 +286,9 @@ impl JjStore {
     }
 
     /// Roll the store back one operation (`ken undo`).
+    ///
+    /// # Errors
+    /// Returns an error if the `jj undo` invocation fails.
     pub fn undo(&self) -> Result<()> {
         self.jj(&["undo"]).map(|_| ())
     }
@@ -242,6 +296,9 @@ impl JjStore {
     /// The tagged change descriptions (`[Ingest] …`, `[GroundCheck:confirmed] …`),
     /// newest first. This is where each [`WriteOp`]'s variant is recorded, so the
     /// audit "groundedness only ever moved via `GroundCheck`" is greppable here.
+    ///
+    /// # Errors
+    /// Returns an error if the `jj log` invocation fails.
     pub fn change_log(&self) -> Result<Vec<Operation>> {
         let template = format!(
             "change_id.short() ++ \"{US}\" ++ committer.timestamp() ++ \"{US}\" ++ description ++ \"{RS}\""
@@ -273,6 +330,9 @@ impl JjStore {
     /// an entity is central in proportion to the *grounded* facts that touch it,
     /// and each fact inherits the centrality of its entity. Ungrounded facts
     /// contribute zero, so data-plane injection cannot inflate the budget.
+    ///
+    /// # Errors
+    /// Returns an error if the facts cannot be read or rewritten.
     pub fn recompute_centrality(&self) -> Result<()> {
         let mut facts = self.all_facts()?;
         if facts.is_empty() {

@@ -14,6 +14,9 @@ use crate::schema::{Locator, SourceRef, SourceRoot};
 
 /// Parse a locator string into a source reference and a locator. `rev` from a
 /// `--rev` flag wins over any inline `@rev`.
+///
+/// # Errors
+/// Returns an error if the input is empty or contains a malformed line range.
 pub fn parse_source(input: &str, rev: Option<String>) -> Result<(SourceRef, Locator)> {
     let input = input.trim();
     if input.is_empty() {

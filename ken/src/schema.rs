@@ -44,6 +44,10 @@ pub struct Claim {
 
 impl Claim {
     /// Parse the `entity.relation` key form used across the CLI/MCP surface.
+    ///
+    /// # Errors
+    /// Returns [`KeyError::Missing`] if `key` is not of the form
+    /// `entity.relation`.
     pub fn parse_key(key: &str) -> Result<Claim, KeyError> {
         let (entity, relation) = key.rsplit_once('.').ok_or(KeyError::Missing)?;
         if entity.is_empty() || relation.is_empty() {

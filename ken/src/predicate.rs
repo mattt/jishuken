@@ -97,6 +97,10 @@ impl Predicate {
     /// Check the predicate is well-formed (regex compiles, pointer is a valid
     /// RFC 6901 string, sub-predicates recurse). Run at `ken ground` time so a
     /// bad predicate can never surface as a runtime outcome.
+    ///
+    /// # Errors
+    /// Returns an error if the regex does not compile or a JSON pointer is not
+    /// a valid RFC 6901 string.
     pub fn validate(&self) -> Result<()> {
         match self {
             Predicate::Matches { regex } => {
@@ -120,6 +124,10 @@ impl Predicate {
 
     /// Parse the CLI mini-grammar: `exists | equals[:lit] | contains[:lit] |
     /// matches:<re> | num:<op>:<n> | ptr:<rfc6901>[:<sub>]`.
+    ///
+    /// # Errors
+    /// Returns an error if the spec names an unknown predicate or carries a
+    /// malformed argument (bad regex, number, operator, or pointer).
     pub fn parse(spec: &str) -> Result<Predicate> {
         let spec = spec.trim();
         let (head, rest) = match spec.split_once(':') {

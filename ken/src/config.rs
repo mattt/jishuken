@@ -178,6 +178,10 @@ impl Sandbox {
 }
 
 impl Config {
+    /// Load and parse a `ken.toml` from `path`.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read or is not valid TOML.
     pub fn load(path: &std::path::Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
@@ -194,6 +198,10 @@ impl Config {
     /// Resolve a [`SourceRoot`] to a filesystem path and the VCS it is read
     /// through. `Project` is the store root's parent; `Store` is the store
     /// itself; `Named` comes from `[sources.*]`.
+    ///
+    /// # Errors
+    /// Returns an error if the store has no parent project, or if a `Named`
+    /// root is unknown or handler-backed rather than a repo.
     pub fn resolve_root(&self, root: &SourceRoot, store_root: &Path) -> Result<(PathBuf, Vcs)> {
         match root {
             SourceRoot::Project => {
@@ -248,6 +256,9 @@ pub fn parse_duration_secs(s: &str) -> Option<f64> {
 }
 
 /// Validate that an op constructor was not asked to set an unknown duration.
+///
+/// # Errors
+/// Returns an error if `s` is not a recognized duration like `90d` or `6h`.
 pub fn require_duration(s: &str) -> Result<f64> {
     parse_duration_secs(s).ok_or_else(|| Error::Config(format!("bad duration: {s}")))
 }
