@@ -77,37 +77,11 @@ mod tests {
     use chrono::{Duration, Utc};
 
     fn fact(vol: Volatility, conf: f64, verified_secs_ago: i64) -> Fact {
-        let now = Utc::now();
-        Fact {
-            id: ChangeId("t".into()),
-            claim: Claim {
-                entity: EntityId("e".into()),
-                relation: "r".into(),
-                nl: None,
-            },
-            value: FactValue::Scalar {
-                value: serde_json::json!("v"),
-            },
-            epistemics: Epistemics {
-                confidence: conf,
-                groundedness: Groundedness::Verified {
-                    at: now,
-                    by: GeneratorHash("h".into()),
-                },
-            },
-            schedule: ScheduleMeta {
-                volatility: vol,
-                centrality: 1.0,
-                last_verified: now - Duration::seconds(verified_secs_ago),
-                variance_at_verify: 0.05,
-                priority: 0.0,
-            },
-            grounds: vec![],
-            provenance: Provenance {
-                ingested_by: "test".into(),
-                ingested_at: now,
-            },
-        }
+        let mut f = crate::test_support::verified_scalar("e.r");
+        f.epistemics.confidence = conf;
+        f.schedule.volatility = vol;
+        f.schedule.last_verified = Utc::now() - Duration::seconds(verified_secs_ago);
+        f
     }
 
     #[test]

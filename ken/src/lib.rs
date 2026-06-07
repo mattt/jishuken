@@ -17,4 +17,7 @@ pub mod store;
 pub mod verify;
 pub mod write;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub use error::{Error, Result};

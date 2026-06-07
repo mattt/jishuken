@@ -52,46 +52,23 @@ mod tests {
     use chrono::Utc;
 
     fn fact(key: &str, conf: f64, centrality: f64, cost: f64) -> Fact {
-        let now = Utc::now();
-        let claim = Claim::parse_key(key).unwrap();
-        Fact {
-            id: ChangeId::for_claim(&claim),
-            claim,
-            value: FactValue::Scalar {
-                value: serde_json::json!("v"),
-            },
-            epistemics: Epistemics {
-                confidence: conf,
-                groundedness: Groundedness::Verified {
-                    at: now,
-                    by: GeneratorHash("h".into()),
-                },
-            },
-            schedule: ScheduleMeta {
-                volatility: Volatility::Immutable, // no decay, isolate VoI inputs
-                centrality,
-                last_verified: now,
-                variance_at_verify: 0.05,
-                priority: 0.0,
-            },
-            grounds: vec![GroundBinding {
-                // A Generator source so the test's `cost` flows into VoI.
-                source: GroundSource::Generator(GeneratorRef {
-                    hash: GeneratorHash("h".into()),
-                    caps: Capabilities::default(),
-                    cost_estimate: cost,
-                    src_path: "verifiers/h.ts".into(),
-                    name: "h.ts".into(),
-                }),
-                locator: Locator::Whole,
-                predicate: Predicate::Exists,
-                last: None,
-            }],
-            provenance: Provenance {
-                ingested_by: "t".into(),
-                ingested_at: now,
-            },
-        }
+        let mut f = crate::test_support::verified_scalar(key);
+        f.epistemics.confidence = conf;
+        f.schedule.centrality = centrality;
+        // A Generator source so the test's `cost` flows into VoI.
+        f.grounds = vec![GroundBinding {
+            source: GroundSource::Generator(GeneratorRef {
+                hash: GeneratorHash("h".into()),
+                caps: Capabilities::default(),
+                cost_estimate: cost,
+                src_path: "verifiers/h.ts".into(),
+                name: "h.ts".into(),
+            }),
+            locator: Locator::Whole,
+            predicate: Predicate::Exists,
+            last: None,
+        }];
+        f
     }
 
     #[test]
