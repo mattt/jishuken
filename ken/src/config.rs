@@ -110,6 +110,20 @@ pub struct Budget {
     pub per_tick: usize,
     /// Base audit rate, scaled up by a fact's centrality.
     pub epsilon: f64,
+    /// Max exploration-floor audits per tick (DESIGN §7), on top of `per_tick`.
+    #[serde(default = "default_audit_per_tick")]
+    pub audit_per_tick: usize,
+    /// Max concurrent ground reads in a tick's read phase. `1` is serial.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+}
+
+fn default_audit_per_tick() -> usize {
+    5
+}
+
+fn default_concurrency() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,6 +147,8 @@ impl Default for Budget {
         Budget {
             per_tick: 20,
             epsilon: 0.02,
+            audit_per_tick: default_audit_per_tick(),
+            concurrency: default_concurrency(),
         }
     }
 }

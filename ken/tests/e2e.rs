@@ -242,6 +242,87 @@ fn tick_checks_grounded_facts() {
     );
 }
 
+/// A tick with `budget.concurrency > 1` fans the read phase across threads but
+/// still applies serially and coalesces centrality into one op (Part B).
+#[test]
+fn concurrent_tick_checks_all_and_coalesces_centrality() {
+    let Some((_dir, store)) = fresh_store() else {
+        return;
+    };
+    // Raise concurrency in the store config, then reopen so it loads.
+    let toml = store
+        .config()
+        .to_toml()
+        .replace("concurrency = 1", "concurrency = 4");
+    std::fs::write(store.root().join("ken.toml"), toml).unwrap();
+    let store = JjStore::open(store.root()).unwrap();
+
+    std::fs::write(store.root().join("d.txt"), "present").unwrap();
+    let keys = ["a.exists", "b.exists", "c.exists", "d.exists"];
+    for key in keys {
+        ingest(&store, key, "present", Volatility::Hours);
+        ground_file(&store, key, "store:d.txt?q=\"present\"", "exists");
+    }
+
+    let results = engine::tick(&store).unwrap();
+    for key in keys {
+        assert!(
+            results.iter().any(|(k, _)| k == key),
+            "{key} should be checked"
+        );
+    }
+    let centrality_ops = store
+        .change_log()
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.description.contains("[Centrality]"))
+        .count();
+    assert!(
+        centrality_ops <= 1,
+        "concurrent tick should still coalesce to one [Centrality] op, got {centrality_ops}"
+    );
+}
+
+/// The exploration floor (DESIGN §7): an audit re-checks a confident fact
+/// through its independent grounds. When one ground drifts to disagree, the
+/// audit surfaces it as Conflicted, never letting the incumbent re-confirm itself.
+#[test]
+fn audit_through_independent_ground_flips_to_conflicted() {
+    let Some((_dir, store)) = fresh_store() else {
+        return;
+    };
+    std::fs::write(store.root().join("a.txt"), "auth lives here").unwrap();
+    std::fs::write(store.root().join("b.txt"), "auth lives here").unwrap();
+    ingest(&store, "auth.handler", "auth lives here", Volatility::Days);
+
+    // Two independent grounds, both confirming -> Verified.
+    ground_file(
+        &store,
+        "auth.handler",
+        "store:a.txt?q=\"auth lives here\"",
+        "exists",
+    );
+    let g = ground_file(
+        &store,
+        "auth.handler",
+        "store:b.txt?q=\"auth lives here\"",
+        "exists",
+    );
+    assert!(
+        matches!(g, Groundedness::Verified { .. }),
+        "expected Verified, got {g:?}"
+    );
+
+    // One independent ground drifts: b.txt no longer contains the quote.
+    std::fs::write(store.root().join("b.txt"), "moved elsewhere").unwrap();
+
+    let g = engine::audit_fact(&store, "auth.handler", true).unwrap();
+    assert!(
+        matches!(g, Groundedness::Conflicted { .. }),
+        "audit should surface the drift as Conflicted, got {g:?}"
+    );
+}
+
 /// A `contains` predicate over a File source judges the span against the claim.
 #[test]
 fn predicate_contains_judges_span() {

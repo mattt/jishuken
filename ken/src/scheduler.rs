@@ -3,7 +3,7 @@
 //! and keep a small exploration floor so a confidently-wrong belief cannot sit
 //! undisturbed forever.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
 use crate::decay::decayed_confidence;
@@ -58,6 +58,62 @@ pub fn audit_probability(f: &Fact, cfg: &Config) -> f64 {
     (cfg.budget.epsilon * f.schedule.centrality).clamp(0.0, 1.0)
 }
 
+/// A ground's verifier identity: the generator/handler content hash, or a shared
+/// `existence` sentinel for verifier-free (file/command) grounds.
+fn ground_identity(b: &GroundBinding) -> &str {
+    ground_hash(b).map_or("existence", |h| h.0.as_str())
+}
+
+/// Whether a fact carries at least two grounds with *distinct* verifier
+/// identities. The exploration floor only audits these: re-running a fact's
+/// lone verifier is a self-confirming fixed point, so an audit needs an
+/// independent verifier to be worth anything (DESIGN §7).
+pub fn has_independent_ground(f: &Fact) -> bool {
+    let mut ids: HashSet<&str> = HashSet::new();
+    for b in &f.grounds {
+        ids.insert(ground_identity(b));
+        if ids.len() >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
+/// A deterministic per-tick draw in `[0,1]` from the fact id and the tick clock,
+/// so the audit decision is reproducible and auditable rather than needing an
+/// RNG. Folding `now` in means each tick is an independent Bernoulli trial.
+fn audit_draw(id: &str, now: Timestamp) -> f64 {
+    let mut h = blake3::Hasher::new();
+    h.update(id.as_bytes());
+    h.update(&now.timestamp_nanos_opt().unwrap_or_default().to_le_bytes());
+    let digest = h.finalize();
+    let n = u32::from_le_bytes(digest.as_bytes()[..4].try_into().unwrap_or_default());
+    f64::from(n) / f64::from(u32::MAX)
+}
+
+/// The exploration floor (DESIGN §7): high-consequence facts the `VoI` ranking
+/// would never re-examine, drawn with probability [`audit_probability`] and
+/// capped at `budget.audit_per_tick`. Excludes facts already in `selected` and
+/// any without an independent ground to audit through.
+pub fn select_audits<'a>(
+    facts: &'a [Fact],
+    now: Timestamp,
+    cfg: &Config,
+    selected: &[&Fact],
+) -> Vec<&'a Fact> {
+    let chosen: HashSet<&str> = selected.iter().map(|f| f.id.0.as_str()).collect();
+    let mut audits: Vec<&Fact> = facts
+        .iter()
+        .filter(|f| f.is_checkable() && has_independent_ground(f))
+        .filter(|f| !chosen.contains(f.id.0.as_str()))
+        .filter(|f| audit_draw(&f.id.0, now) < audit_probability(f, cfg))
+        .collect();
+    // Spend the cap where wrong is most expensive.
+    audits.sort_by(|a, b| audit_probability(b, cfg).total_cmp(&audit_probability(a, cfg)));
+    audits.truncate(cfg.budget.audit_per_tick);
+    audits
+}
+
 /// Facts ranked by descending `VoI`.
 pub fn rank<'a>(
     facts: &'a [Fact],
@@ -95,23 +151,34 @@ mod tests {
     use crate::schema::*;
     use chrono::Utc;
 
+    fn gen_ground(hash: &str, cost: f64) -> GroundBinding {
+        GroundBinding {
+            source: GroundSource::Generator(GeneratorRef {
+                hash: GeneratorHash(hash.into()),
+                caps: Capabilities::default(),
+                cost_estimate: cost,
+                src_path: format!("verifiers/{hash}.ts"),
+                name: format!("{hash}.ts"),
+            }),
+            locator: Locator::Whole,
+            predicate: Predicate::Exists,
+            last: None,
+        }
+    }
+
     fn fact(key: &str, conf: f64, centrality: f64, cost: f64) -> Fact {
         let mut f = crate::test_support::verified_scalar(key);
         f.epistemics.confidence = conf;
         f.schedule.centrality = centrality;
         // A Generator source so the test's `cost` flows into VoI.
-        f.grounds = vec![GroundBinding {
-            source: GroundSource::Generator(GeneratorRef {
-                hash: GeneratorHash("h".into()),
-                caps: Capabilities::default(),
-                cost_estimate: cost,
-                src_path: "verifiers/h.ts".into(),
-                name: "h.ts".into(),
-            }),
-            locator: Locator::Whole,
-            predicate: Predicate::Exists,
-            last: None,
-        }];
+        f.grounds = vec![gen_ground("h", cost)];
+        f
+    }
+
+    /// A fact with two distinct-identity grounds, so it is audit-eligible.
+    fn multi_ground_fact(key: &str, centrality: f64) -> Fact {
+        let mut f = fact(key, 0.99, centrality, 1.0);
+        f.grounds = vec![gen_ground("h1", 1.0), gen_ground("h2", 1.0)];
         f
     }
 
@@ -170,5 +237,56 @@ mod tests {
         let central = fact("a.x", 0.99, 10.0, 1.0);
         let leaf = fact("b.x", 0.99, 0.1, 1.0);
         assert!(audit_probability(&central, &cfg) > audit_probability(&leaf, &cfg));
+    }
+
+    #[test]
+    fn audit_picks_multi_ground_facts_when_forced() {
+        let mut cfg = Config::default();
+        cfg.budget.epsilon = 1.0; // p = 1, so the draw always selects
+        let now = Utc::now();
+        let facts = vec![multi_ground_fact("a.x", 1.0)];
+        let audits = select_audits(&facts, now, &cfg, &[]);
+        assert_eq!(audits.len(), 1);
+    }
+
+    #[test]
+    fn audit_skips_single_ground_facts() {
+        let mut cfg = Config::default();
+        cfg.budget.epsilon = 1.0;
+        let now = Utc::now();
+        // One ground => no independent verifier => never audited.
+        let facts = vec![fact("a.x", 0.99, 1.0, 1.0)];
+        assert!(select_audits(&facts, now, &cfg, &[]).is_empty());
+    }
+
+    #[test]
+    fn audit_excludes_already_selected() {
+        let mut cfg = Config::default();
+        cfg.budget.epsilon = 1.0;
+        let now = Utc::now();
+        let facts = vec![multi_ground_fact("a.x", 1.0)];
+        let selected: Vec<&Fact> = facts.iter().collect();
+        assert!(select_audits(&facts, now, &cfg, &selected).is_empty());
+    }
+
+    #[test]
+    fn audit_zero_epsilon_selects_none() {
+        let mut cfg = Config::default();
+        cfg.budget.epsilon = 0.0;
+        let now = Utc::now();
+        let facts = vec![multi_ground_fact("a.x", 1.0)];
+        assert!(select_audits(&facts, now, &cfg, &[]).is_empty());
+    }
+
+    #[test]
+    fn audit_respects_the_cap() {
+        let mut cfg = Config::default();
+        cfg.budget.epsilon = 1.0;
+        cfg.budget.audit_per_tick = 2;
+        let now = Utc::now();
+        let facts: Vec<Fact> = (0..5)
+            .map(|i| multi_ground_fact(&format!("e{i}.x"), 1.0))
+            .collect();
+        assert_eq!(select_audits(&facts, now, &cfg, &[]).len(), 2);
     }
 }
