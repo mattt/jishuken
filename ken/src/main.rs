@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use ken::decay::{decayed_confidence, half_life_secs};
 use ken::engine;
@@ -41,23 +41,7 @@ enum Command {
     Init,
 
     /// Add a fact. Lands `Ungrounded`. Key is `entity.relation`.
-    Add {
-        key: String,
-        /// Scalar value. Omit when using `--json`.
-        value: Option<String>,
-        /// Read a JSON value (array → set-valued fact) from a file.
-        #[arg(long)]
-        json: Option<PathBuf>,
-        #[arg(long, default_value = "days")]
-        volatility: Volatility,
-        /// Name where the truth should be checked (a hint; stays Ungrounded
-        /// until the control plane grounds it).
-        #[arg(long)]
-        ground: Option<String>,
-        /// LLM triage meta-confidence; clamped to the ingest ceiling.
-        #[arg(long)]
-        meta_confidence: Option<f64>,
-    },
+    Add(AddArgs),
 
     /// Recall a fact: value plus full epistemics.
     Recall {
@@ -76,24 +60,7 @@ enum Command {
     },
 
     /// Find facts by entity, relation, or text.
-    Search {
-        #[arg(default_value = "")]
-        query: String,
-        #[arg(long)]
-        entity: Option<String>,
-        #[arg(long)]
-        relation: Option<String>,
-        /// Filter by groundedness: ungrounded | verified | conflicted.
-        #[arg(long)]
-        grounded: Option<String>,
-        /// Only facts already due for re-check.
-        #[arg(long)]
-        due: bool,
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        #[arg(long)]
-        json: bool,
-    },
+    Search(SearchArgs),
 
     /// Facts currently holding two answers.
     Conflicts,
@@ -106,26 +73,7 @@ enum Command {
 
     /// Bind an independent ground source to a fact (control plane). Exactly one
     /// of --source / --command / --generator picks the source kind.
-    Ground {
-        key: String,
-        /// File source locator, e.g. `wiki:Architecture.md#authentication`.
-        #[arg(long)]
-        source: Option<String>,
-        /// Command source, e.g. `curl -s https://api.internal/release`
-        /// (argv[0] must be in the `[command] allow` list).
-        #[arg(long)]
-        command: Option<String>,
-        /// Generator source: a sandboxed Deno script that emits the value.
-        #[arg(long)]
-        generator: Option<PathBuf>,
-        /// Pin the source revision (File sources).
-        #[arg(long)]
-        rev: Option<String>,
-        /// How to judge the span: exists | equals[:lit] | contains[:lit] |
-        /// matches:<re> | num:<op>:<n> | ptr:<rfc6901>[:<sub>].
-        #[arg(long, default_value = "exists")]
-        predicate: String,
-    },
+    Ground(GroundArgs),
 
     /// Force a ground check now (control plane).
     Verify { key: String },
@@ -172,6 +120,67 @@ enum Command {
     Mcp,
 }
 
+#[derive(Args)]
+struct AddArgs {
+    key: String,
+    /// Scalar value. Omit when using `--json`.
+    value: Option<String>,
+    /// Read a JSON value (array → set-valued fact) from a file.
+    #[arg(long)]
+    json: Option<PathBuf>,
+    #[arg(long, default_value = "days")]
+    volatility: Volatility,
+    /// Name where the truth should be checked (a hint; stays Ungrounded
+    /// until the control plane grounds it).
+    #[arg(long)]
+    ground: Option<String>,
+    /// LLM triage meta-confidence; clamped to the ingest ceiling.
+    #[arg(long)]
+    meta_confidence: Option<f64>,
+}
+
+#[derive(Args)]
+struct SearchArgs {
+    #[arg(default_value = "")]
+    query: String,
+    #[arg(long)]
+    entity: Option<String>,
+    #[arg(long)]
+    relation: Option<String>,
+    /// Filter by groundedness: ungrounded | verified | conflicted.
+    #[arg(long)]
+    grounded: Option<String>,
+    /// Only facts already due for re-check.
+    #[arg(long)]
+    due: bool,
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct GroundArgs {
+    key: String,
+    /// File source locator, e.g. `wiki:Architecture.md#authentication`.
+    #[arg(long)]
+    source: Option<String>,
+    /// Command source, e.g. `curl -s https://api.internal/release`
+    /// (argv[0] must be in the `[command] allow` list).
+    #[arg(long)]
+    command: Option<String>,
+    /// Generator source: a sandboxed Deno script that emits the value.
+    #[arg(long)]
+    generator: Option<PathBuf>,
+    /// Pin the source revision (File sources).
+    #[arg(long)]
+    rev: Option<String>,
+    /// How to judge the span: exists | equals[:lit] | contains[:lit] |
+    /// matches:<re> | num:<op>:<n> | ptr:<rfc6901>[:<sub>].
+    #[arg(long, default_value = "exists")]
+    predicate: String,
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -196,48 +205,18 @@ fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Init => unreachable!(),
-        Command::Add {
-            key,
-            value,
-            json,
-            volatility,
-            ground,
-            meta_confidence,
-        } => cmd_add(
-            &store,
-            key,
-            value,
-            json,
-            volatility,
-            ground,
-            meta_confidence,
-        )?,
+        Command::Add(args) => cmd_add(&store, args)?,
         Command::Recall { key, json } => cmd_recall(&store, &key, json)?,
         Command::Why { key } => cmd_why(&store, &key)?,
         Command::Stale { limit } => cmd_stale(&store, limit)?,
-        Command::Search {
-            query,
-            entity,
-            relation,
-            grounded,
-            due,
-            limit,
-            json,
-        } => cmd_search(&store, &query, entity, relation, grounded, due, limit, json)?,
+        Command::Search(args) => cmd_search(&store, args)?,
         Command::Conflicts => cmd_conflicts(&store)?,
         Command::Log => cmd_log(&store)?,
         Command::Undo => {
             store.undo()?;
             println!("rolled back one operation");
         }
-        Command::Ground {
-            key,
-            source,
-            command,
-            generator,
-            rev,
-            predicate,
-        } => cmd_ground(&store, &key, source, command, generator, rev, &predicate)?,
+        Command::Ground(args) => cmd_ground(&store, args)?,
         Command::Verify { key } => {
             let g = engine::verify_fact(&store, &key)?;
             println!("{key} -> {}", g.label());
@@ -285,12 +264,14 @@ fn open_store(cli: &Cli) -> anyhow::Result<JjStore> {
 
 fn cmd_add(
     store: &JjStore,
-    key: String,
-    value: Option<String>,
-    json: Option<PathBuf>,
-    volatility: Volatility,
-    ground: Option<String>,
-    meta_confidence: Option<f64>,
+    AddArgs {
+        key,
+        value,
+        json,
+        volatility,
+        ground,
+        meta_confidence,
+    }: AddArgs,
 ) -> anyhow::Result<()> {
     let claim = Claim::parse_key(&key)?;
     let value = match (json, value) {
@@ -362,14 +343,16 @@ fn source_to_ground(store: &JjStore, src: SourceRef) -> anyhow::Result<GroundSou
 
 fn cmd_ground(
     store: &JjStore,
-    key: &str,
-    source: Option<String>,
-    command: Option<String>,
-    generator: Option<PathBuf>,
-    rev: Option<String>,
-    predicate: &str,
+    GroundArgs {
+        key,
+        source,
+        command,
+        generator,
+        rev,
+        predicate,
+    }: GroundArgs,
 ) -> anyhow::Result<()> {
-    let predicate = Predicate::parse(predicate)?;
+    let predicate = Predicate::parse(&predicate)?;
     let (ground_source, locator) = match (source, command, generator) {
         (Some(s), None, None) => {
             let (src, locator) = parse_source(&s, rev)?;
@@ -402,7 +385,7 @@ fn cmd_ground(
         predicate,
         last: None,
     };
-    let g = engine::ground(store, key, binding)?;
+    let g = engine::ground(store, &key, binding)?;
     println!("{key} grounded -> {}", g.label());
     Ok(())
 }
@@ -544,19 +527,17 @@ fn cmd_stale(store: &JjStore, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the clap subcommand fields"
-)]
 fn cmd_search(
     store: &JjStore,
-    query: &str,
-    entity: Option<String>,
-    relation: Option<String>,
-    grounded: Option<String>,
-    due: bool,
-    limit: usize,
-    json: bool,
+    SearchArgs {
+        query,
+        entity,
+        relation,
+        grounded,
+        due,
+        limit,
+        json,
+    }: SearchArgs,
 ) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
