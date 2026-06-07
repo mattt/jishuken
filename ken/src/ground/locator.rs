@@ -10,7 +10,7 @@
 //! - `@<rev>` suffix             a pinned revision (also settable via `--rev`)
 
 use crate::error::{Error, Result};
-use crate::schema::{Locator, SourceRef, SourceRoot};
+use crate::schema::{GroundBinding, GroundSource, Locator, SourceRef, SourceRoot};
 
 /// Parse a locator string into a source reference and a locator. `rev` from a
 /// `--rev` flag wins over any inline `@rev`.
@@ -128,6 +128,24 @@ fn lang_for(path: &str) -> String {
         _ => "text",
     }
     .to_string()
+}
+
+/// Render a ground binding's source to its human string form, shared by `why`,
+/// `recall`, the MCP surface, and the tagged jj op label.
+pub fn render_ground(binding: &GroundBinding) -> String {
+    match &binding.source {
+        GroundSource::File(src) => render_source(src, &binding.locator),
+        GroundSource::Command(cmd) => format!("$ {}", cmd.argv.join(" ")),
+        GroundSource::Generator(gr) => format!("gen {}", gr.display()),
+        GroundSource::Handler(h) => render_source(
+            &SourceRef {
+                root: SourceRoot::Named(h.handler.scheme.clone()),
+                path: h.reference.clone(),
+                rev: h.rev.clone(),
+            },
+            &binding.locator,
+        ),
+    }
 }
 
 /// Render a `(SourceRef, Locator)` back to its string form, for `why`/`recall`.

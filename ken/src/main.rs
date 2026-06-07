@@ -18,7 +18,7 @@ use ken::predicate::Predicate;
 use ken::scheduler;
 use ken::schema::{
     Claim, CommandSource, Element, Epistemics, Fact, FactValue, GroundBinding, GroundSource,
-    Groundedness, HandlerSource, Locator, SourceRef, SourceRoot, TriageSource, Volatility,
+    Groundedness, Locator, SourceRef, SourceRoot, TriageSource, Volatility,
 };
 use ken::store::{JjStore, VersionedStore};
 use ken::verify::authority;
@@ -509,7 +509,7 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
         println!(
             "  ground     {}  {}  [{}]{}",
             g.source.kind_label(),
-            render_ground(g),
+            ken::ground::render_ground(g),
             g.predicate.label(),
             span
         );
@@ -819,7 +819,7 @@ fn grounds_json(fact: &Fact) -> serde_json::Value {
         .iter()
         .map(|g| {
             serde_json::json!({
-                "source": render_ground(g),
+                "source": ken::ground::render_ground(g),
                 "kind": g.source.kind_label(),
                 "predicate": g.predicate.label(),
                 "last": g.last.as_ref().map(|r| serde_json::json!({
@@ -850,27 +850,7 @@ fn confirming_ground(fact: &Fact) -> Option<String> {
                 .at
                 .cmp(&b.last.as_ref().unwrap().at)
         })
-        .map(render_ground)
-}
-
-/// A human description of a ground's source for `recall`/`why`.
-fn render_ground(g: &GroundBinding) -> String {
-    match &g.source {
-        GroundSource::File(src) => ken::ground::render_source(src, &g.locator),
-        GroundSource::Command(cmd) => format!("$ {}", cmd.argv.join(" ")),
-        GroundSource::Generator(gr) => format!("gen {}", gr.display()),
-        GroundSource::Handler(h) => ken::ground::render_source(&handler_ref(h), &g.locator),
-    }
-}
-
-/// Reconstruct the CURIE `SourceRef` a handler binding renders as, e.g.
-/// `wiki:Architecture` (the locator and rev are appended by `render_source`).
-fn handler_ref(h: &HandlerSource) -> SourceRef {
-    SourceRef {
-        root: SourceRoot::Named(h.handler.scheme.clone()),
-        path: h.reference.clone(),
-        rev: h.rev.clone(),
-    }
+        .map(ken::ground::render_ground)
 }
 
 fn volatility_label(v: Volatility) -> &'static str {

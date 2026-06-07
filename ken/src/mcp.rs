@@ -6,11 +6,8 @@
 use std::path::PathBuf;
 
 use ken::decay::decayed_confidence;
-use ken::ground::render_source;
-use ken::schema::{
-    Claim, Fact, FactValue, GroundSource, Groundedness, SourceRef, SourceRoot, TriageSource,
-    Volatility,
-};
+use ken::ground::render_ground;
+use ken::schema::{Claim, Fact, FactValue, Groundedness, TriageSource, Volatility};
 use ken::store::{JjStore, VersionedStore};
 use ken::write::WriteOp;
 use rmcp::handler::server::wrapper::Parameters;
@@ -182,21 +179,8 @@ fn grounds_of(fact: &Fact) -> Value {
         .grounds
         .iter()
         .map(|g| {
-            let source = match &g.source {
-                GroundSource::File(src) => render_source(src, &g.locator),
-                GroundSource::Command(cmd) => format!("$ {}", cmd.argv.join(" ")),
-                GroundSource::Generator(gr) => format!("gen {}", gr.display()),
-                GroundSource::Handler(h) => render_source(
-                    &SourceRef {
-                        root: SourceRoot::Named(h.handler.scheme.clone()),
-                        path: h.reference.clone(),
-                        rev: h.rev.clone(),
-                    },
-                    &g.locator,
-                ),
-            };
             json!({
-                "source": source,
+                "source": render_ground(g),
                 "kind": g.source.kind_label(),
                 "predicate": g.predicate.label(),
                 "last": g.last.as_ref().map(|r| json!({

@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::ground::generator::GeneratorRegistry;
 use crate::schema::{
     path_for, ChangeId, Claim, Epistemics, Fact, FactValue, GeneratorHash, GroundBinding,
-    GroundSource, Groundedness, Provenance, ScheduleMeta, SourceRef, SourceRoot, Timestamp,
+    Groundedness, Provenance, ScheduleMeta, Timestamp,
 };
 use crate::write::{landed_confidence, Outcome, WriteOp};
 
@@ -427,7 +427,11 @@ impl VersionedStore for JjStore {
                 fact: id, binding, ..
             } => {
                 let mut fact = self.read_fact(&id, Rev::Working)?;
-                let detail = format!("{} <- {}", fact.claim.key(), ground_label(&binding));
+                let detail = format!(
+                    "{} <- {}",
+                    fact.claim.key(),
+                    crate::ground::render_ground(&binding)
+                );
                 fact.grounds.push(binding);
                 self.write_fact(&fact)?;
                 self.commit(&tag, &detail)?;
@@ -554,23 +558,6 @@ impl VersionedStore for JjStore {
         Ok(Workspace {
             change: self.current_change_id()?,
         })
-    }
-}
-
-/// A short label for a ground binding's source, for the tagged jj op.
-fn ground_label(binding: &GroundBinding) -> String {
-    match &binding.source {
-        GroundSource::File(src) => crate::ground::render_source(src, &binding.locator),
-        GroundSource::Command(cmd) => format!("$ {}", cmd.argv.join(" ")),
-        GroundSource::Generator(gr) => format!("gen {}", gr.display()),
-        GroundSource::Handler(h) => crate::ground::render_source(
-            &SourceRef {
-                root: SourceRoot::Named(h.handler.scheme.clone()),
-                path: h.reference.clone(),
-                rev: h.rev.clone(),
-            },
-            &binding.locator,
-        ),
     }
 }
 
