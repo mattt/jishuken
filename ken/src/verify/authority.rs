@@ -26,6 +26,7 @@ pub fn ground_check(
     by: Option<GeneratorHash>,
     resolved: Option<Resolved>,
     set_update: Option<Vec<Element>>,
+    observed_cost: Option<f64>,
 ) -> WriteOp {
     WriteOp::GroundCheck {
         fact,
@@ -34,6 +35,7 @@ pub fn ground_check(
         by,
         resolved,
         set_update,
+        observed_cost,
         _auth: ControlToken::mint(),
     }
 }

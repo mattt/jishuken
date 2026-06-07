@@ -508,13 +508,14 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
 fn cmd_stale(store: &JjStore, limit: usize) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
-    let ranked = scheduler::rank(&facts, now, store.config());
+    let costs = store.cost_table();
+    let ranked = scheduler::rank(&facts, now, store.config(), &costs);
     if ranked.is_empty() {
         println!("no facts");
         return Ok(());
     }
     for f in ranked.into_iter().take(limit) {
-        let voi = scheduler::voi_score(f, now, store.config());
+        let voi = scheduler::voi_score(f, now, store.config(), &costs);
         let conf = decayed_confidence(f, now, store.config());
         println!(
             "{:<28} voi={:>7.3}  conf={:.2}  {}",
@@ -541,6 +542,7 @@ fn cmd_search(
 ) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
+    let costs = store.cost_table();
     let q = query.to_lowercase();
 
     let mut hits: Vec<&Fact> = facts
@@ -561,10 +563,11 @@ fn cmd_search(
         .collect();
 
     hits.sort_by(|a, b| {
-        scheduler::voi_score(b, now, store.config()).total_cmp(&scheduler::voi_score(
+        scheduler::voi_score(b, now, store.config(), &costs).total_cmp(&scheduler::voi_score(
             a,
             now,
             store.config(),
+            &costs,
         ))
     });
     hits.truncate(limit);

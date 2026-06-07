@@ -15,6 +15,10 @@ use crate::schema::{
 use crate::store::{JjStore, VersionedStore};
 use crate::verify::authority;
 
+/// The product of reading and judging one ground: the verdict, the replay
+/// state to record, any set-diff update, and the measured read cost (seconds).
+type GroundOutcome = (Outcome, Option<Resolved>, Option<Vec<Element>>, Option<f64>);
+
 /// The generator hash that produced a check, if the source is a Generator.
 fn ground_by(binding: &GroundBinding) -> Option<GeneratorHash> {
     match &binding.source {
@@ -31,6 +35,13 @@ fn ground_by(binding: &GroundBinding) -> Option<GeneratorHash> {
 /// Returns an error if the fact is unknown, has no grounds bound, or a store
 /// read or write fails.
 pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
+    verify_fact_inner(store, key, true)
+}
+
+/// Check every ground of a fact, optionally recomputing centrality after each
+/// `GroundCheck`. Single-shot callers recompute (fresh centrality); the
+/// scheduler tick defers it to one recompute after the whole tick (Idea 1).
+fn verify_fact_inner(store: &JjStore, key: &str, recompute: bool) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
     if fact.grounds.is_empty() {
         return Err(Error::Verifier(format!(
@@ -39,16 +50,22 @@ pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
     }
     let id = ChangeId::for_claim(&fact.claim);
     for idx in 0..fact.grounds.len() {
-        let (outcome, resolved, set_update) = check_ground(store, &fact, idx)?;
+        let (outcome, resolved, set_update, observed_cost) = check_ground(store, &fact, idx)?;
         let by = ground_by(&fact.grounds[idx]);
-        store.apply(authority::ground_check(
+        let op = authority::ground_check(
             id.clone(),
             idx,
             outcome,
             by,
             resolved,
             set_update,
-        ))?;
+            observed_cost,
+        );
+        if recompute {
+            store.apply(op)?;
+        } else {
+            store.apply_no_centrality(op)?;
+        }
     }
     Ok(store.read_fact_by_key(key)?.epistemics.groundedness)
 }
@@ -60,19 +77,23 @@ pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
 /// # Errors
 /// Currently infallible; the `Result` mirrors the `GroundCheck` op it feeds, as
 /// source-read failures are reported as an [`Outcome`] rather than an error.
-pub fn check_ground(
-    store: &JjStore,
-    fact: &Fact,
-    idx: usize,
-) -> Result<(Outcome, Option<Resolved>, Option<Vec<Element>>)> {
+pub fn check_ground(store: &JjStore, fact: &Fact, idx: usize) -> Result<GroundOutcome> {
     let binding = &fact.grounds[idx];
     let now = Utc::now();
     let claim = fact.value.as_env();
     let by = ground_by(binding);
 
-    match read_binding(store.config(), store.root(), binding, &claim) {
-        ReadResult::Errored(_) => Ok((Outcome::Errored, None, None)),
-        ReadResult::Transient => Ok((Outcome::Inconclusive, None, None)),
+    // Time the read so a generator's measured run time can feed VoI (Idea 2).
+    let started = std::time::Instant::now();
+    let read = read_binding(store.config(), store.root(), binding, &claim);
+    let elapsed = started.elapsed().as_secs_f64();
+    // Only a generator/handler check that ran to a usable signal has a cost
+    // worth recording; a spawn failure or transient miss does not.
+    let observed = |oc: Outcome| (by.is_some() && oc.updates_belief()).then_some(elapsed);
+
+    match read {
+        ReadResult::Errored(_) => Ok((Outcome::Errored, None, None, None)),
+        ReadResult::Transient => Ok((Outcome::Inconclusive, None, None, None)),
         // The locator no longer resolves: an existence failure (the fact moved).
         // Record a refuting Resolved (empty span hash) so the aggregate sees it.
         ReadResult::Unresolved => {
@@ -83,7 +104,12 @@ pub fn check_ground(
                 outcome: Outcome::Refuted,
                 by: by.clone(),
             };
-            Ok((Outcome::Refuted, Some(resolved), None))
+            Ok((
+                Outcome::Refuted,
+                Some(resolved),
+                None,
+                observed(Outcome::Refuted),
+            ))
         }
         ReadResult::Resolved(span) => {
             let holds = binding.predicate.eval(&claim, &span.text);
@@ -97,6 +123,7 @@ pub fn check_ground(
             } else {
                 None
             };
+            let observed_cost = observed(outcome);
             let resolved = Resolved {
                 rev: span.rev,
                 span_hash: span.span_hash,
@@ -104,7 +131,7 @@ pub fn check_ground(
                 outcome,
                 by,
             };
-            Ok((outcome, Some(resolved), set_update))
+            Ok((outcome, Some(resolved), set_update, observed_cost))
         }
     }
 }
@@ -164,10 +191,16 @@ pub fn ground(store: &JjStore, key: &str, binding: GroundBinding) -> Result<Grou
 
     let fact = store.read_fact_by_key(key)?;
     let idx = fact.grounds.len() - 1;
-    let (outcome, resolved, set_update) = check_ground(store, &fact, idx)?;
+    let (outcome, resolved, set_update, observed_cost) = check_ground(store, &fact, idx)?;
     let by = ground_by(&fact.grounds[idx]);
     store.apply(authority::ground_check(
-        id, idx, outcome, by, resolved, set_update,
+        id,
+        idx,
+        outcome,
+        by,
+        resolved,
+        set_update,
+        observed_cost,
     ))?;
     Ok(store.read_fact_by_key(key)?.epistemics.groundedness)
 }
@@ -224,15 +257,21 @@ pub fn grant(
 pub fn tick(store: &JjStore) -> Result<Vec<(String, Groundedness)>> {
     let now = Utc::now();
     let facts = store.all_facts()?;
-    let keys: Vec<String> = crate::scheduler::select_tick(&facts, now, store.config())
+    let costs = store.cost_table();
+    let keys: Vec<String> = crate::scheduler::select_tick(&facts, now, store.config(), &costs)
         .iter()
         .map(|f| f.claim.key())
         .collect();
     let mut results = Vec::new();
     for key in keys {
-        if let Ok(g) = verify_fact(store, &key) {
+        // Defer centrality: each check commits without recomputing, then we
+        // recompute once for the whole tick (Idea 1) instead of per check.
+        if let Ok(g) = verify_fact_inner(store, &key, false) {
             results.push((key, g));
         }
+    }
+    if store.recompute_centrality()? {
+        store.control_commit("Centrality", "tick")?;
     }
     Ok(results)
 }

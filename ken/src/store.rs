@@ -4,6 +4,7 @@
 //! concurrent disagreeing write becomes a real jj conflict instead of a lost
 //! update. Every [`WriteOp`] becomes one tagged jj operation.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,6 +20,7 @@ use crate::schema::{
     path_for, ChangeId, Claim, Epistemics, Fact, FactValue, GeneratorHash, GroundBinding,
     Groundedness, Provenance, ScheduleMeta, Timestamp,
 };
+use crate::sketch::TDigest;
 use crate::write::{landed_confidence, Outcome, WriteOp};
 
 /// Which revision to read at. `@` is the working copy.
@@ -285,6 +287,41 @@ impl JjStore {
             .collect())
     }
 
+    fn costs_path(&self) -> PathBuf {
+        self.root.join("costs.json")
+    }
+
+    /// Per-generator t-digests of observed run times, keyed by generator hash.
+    fn load_costs(&self) -> HashMap<String, TDigest> {
+        match std::fs::read(self.costs_path()) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Fold one observed run time (seconds) into a generator's cost sketch
+    /// (Idea 2). Keyed by the content hash, so the measurement pools across
+    /// every fact that shares the generator and merges across revisions.
+    ///
+    /// # Errors
+    /// Returns an error if the cost sketch file cannot be written.
+    pub fn record_cost(&self, by: &GeneratorHash, secs: f64) -> Result<()> {
+        let mut costs = self.load_costs();
+        costs.entry(by.0.clone()).or_default().insert(secs);
+        std::fs::write(self.costs_path(), serde_json::to_vec_pretty(&costs)?)?;
+        Ok(())
+    }
+
+    /// Materialize the median observed run time per generator, for the `VoI`
+    /// cost denominator. Generators with no samples are absent (the caller falls
+    /// back to the static `cost_estimate`).
+    pub fn cost_table(&self) -> HashMap<GeneratorHash, f64> {
+        self.load_costs()
+            .into_iter()
+            .filter_map(|(hash, digest)| digest.quantile(0.5).map(|p50| (GeneratorHash(hash), p50)))
+            .collect()
+    }
+
     /// Roll the store back one operation (`ken undo`).
     ///
     /// # Errors
@@ -315,12 +352,15 @@ impl JjStore {
     /// and each fact inherits the centrality of its entity. Ungrounded facts
     /// contribute zero, so data-plane injection cannot inflate the budget.
     ///
+    /// Returns `true` if any fact's centrality changed (and was rewritten), so
+    /// callers that coalesce the recompute can skip an empty commit.
+    ///
     /// # Errors
     /// Returns an error if the facts cannot be read or rewritten.
-    pub fn recompute_centrality(&self) -> Result<()> {
+    pub fn recompute_centrality(&self) -> Result<bool> {
         let mut facts = self.all_facts()?;
         if facts.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut g = FactGraph::new();
         for f in &facts {
@@ -331,6 +371,7 @@ impl JjStore {
             g.add_edge(&f.id.0, &format!("entity:{}", f.claim.entity.0));
         }
         let c = g.katz_trust_weighted(0.5, 50);
+        let mut changed = false;
         for f in &mut facts {
             let centrality = c
                 .get(&format!("entity:{}", f.claim.entity.0))
@@ -339,9 +380,10 @@ impl JjStore {
             if (f.schedule.centrality - centrality).abs() > 1e-9 {
                 f.schedule.centrality = centrality;
                 self.write_fact(f)?;
+                changed = true;
             }
         }
-        Ok(())
+        Ok(changed)
     }
 }
 
@@ -367,134 +409,7 @@ impl VersionedStore for JjStore {
     }
 
     fn apply(&self, op: WriteOp) -> Result<ChangeId> {
-        let tag = op.tag();
-        match op {
-            WriteOp::Ingest {
-                claim,
-                value,
-                triage,
-                volatility,
-                draft_ground,
-            } => {
-                let now = Utc::now();
-                let id = ChangeId::for_claim(&claim);
-                let fact = Fact {
-                    id: id.clone(),
-                    claim: claim.clone(),
-                    value,
-                    epistemics: Epistemics {
-                        confidence: landed_confidence(&triage),
-                        groundedness: Groundedness::Ungrounded { source: triage },
-                    },
-                    schedule: ScheduleMeta {
-                        volatility,
-                        centrality: 1.0,
-                        last_verified: now,
-                        variance_at_verify: INGEST_VARIANCE,
-                        priority: 0.0,
-                    },
-                    // A `--ground` hint lands as a draft binding (no verifier,
-                    // unchecked); it does not move groundedness.
-                    grounds: draft_ground.into_iter().collect(),
-                    provenance: Provenance {
-                        ingested_by: whoami(),
-                        ingested_at: now,
-                    },
-                };
-                self.write_fact(&fact)?;
-                self.recompute_centrality()?;
-                self.commit(&tag, &claim.key())?;
-                Ok(id)
-            }
-
-            WriteOp::Ground {
-                fact: id, binding, ..
-            } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
-                let detail = format!(
-                    "{} <- {}",
-                    fact.claim.key(),
-                    crate::ground::render_ground(&binding)
-                );
-                fact.grounds.push(binding);
-                self.write_fact(&fact)?;
-                self.commit(&tag, &detail)?;
-                Ok(id)
-            }
-
-            WriteOp::GroundCheck {
-                fact: id,
-                ground,
-                outcome,
-                resolved,
-                set_update,
-                ..
-            } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
-                let now = Utc::now();
-                let net = fact.grounds.get(ground).is_some_and(GroundBinding::is_net);
-
-                // Record the replay state on the ground that was checked.
-                if let (Some(g), Some(r)) = (fact.grounds.get_mut(ground), resolved.clone()) {
-                    g.last = Some(r);
-                }
-                // Set-valued facts: replace elements with the diffed set (Step 9).
-                if let Some(elements) = set_update {
-                    fact.value = FactValue::Set { elements };
-                }
-
-                if outcome.updates_belief() {
-                    let prior_var = decayed_variance(&fact, now, &self.config);
-                    let prior = crate::decay::decayed_confidence(&fact, now, &self.config);
-                    let confirmed = outcome == Outcome::Confirmed;
-                    let (conf, var) = kalman_update(prior, prior_var, confirmed, net);
-                    fact.epistemics.confidence = conf;
-                    fact.schedule.last_verified = now;
-                    fact.schedule.variance_at_verify = var;
-                    self.append_calibration(&CalibrationSample {
-                        prior,
-                        grounded_outcome: confirmed,
-                    })?;
-                }
-                // Recompute groundedness from ALL grounds: independent grounds
-                // that split between confirm and refute -> Conflicted (DESIGN §7).
-                fact.epistemics.groundedness = aggregate_groundedness(&fact);
-
-                self.write_fact(&fact)?;
-                self.recompute_centrality()?;
-                let by = resolved
-                    .as_ref()
-                    .and_then(|r| r.by.as_ref().map(ToString::to_string))
-                    .unwrap_or_else(|| "existence".to_string());
-                self.commit(&tag, &format!("{} #{ground} {by}", fact.claim.key()))?;
-                Ok(id)
-            }
-
-            WriteOp::Reschedule {
-                fact: id,
-                new_priority,
-                ..
-            } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
-                fact.schedule.priority = new_priority;
-                self.write_fact(&fact)?;
-                self.commit(&tag, &fact.claim.key())?;
-                Ok(id)
-            }
-
-            WriteOp::ManualOverride {
-                fact: id,
-                set,
-                reason,
-                ..
-            } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
-                fact.epistemics = set;
-                self.write_fact(&fact)?;
-                self.commit(&tag, &format!("{} :: {}", fact.claim.key(), reason))?;
-                Ok(id)
-            }
-        }
+        self.apply_op(op, true)
     }
 
     fn list_conflicts(&self) -> Result<Vec<ChangeId>> {
@@ -530,6 +445,161 @@ impl VersionedStore for JjStore {
         Ok(Workspace {
             change: self.current_change_id()?,
         })
+    }
+}
+
+impl JjStore {
+    /// Apply a write op without recomputing centrality. The scheduler tick
+    /// (Idea 1) uses this to coalesce N per-check recomputes into one after the
+    /// loop; `recompute_centrality` is then called once and committed separately.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying write or `jj` invocation fails.
+    pub fn apply_no_centrality(&self, op: WriteOp) -> Result<ChangeId> {
+        self.apply_op(op, false)
+    }
+
+    fn apply_op(&self, op: WriteOp, recompute_centrality: bool) -> Result<ChangeId> {
+        let tag = op.tag();
+        match op {
+            WriteOp::Ingest {
+                claim,
+                value,
+                triage,
+                volatility,
+                draft_ground,
+            } => {
+                let now = Utc::now();
+                let id = ChangeId::for_claim(&claim);
+                let fact = Fact {
+                    id: id.clone(),
+                    claim: claim.clone(),
+                    value,
+                    epistemics: Epistemics {
+                        confidence: landed_confidence(&triage),
+                        groundedness: Groundedness::Ungrounded { source: triage },
+                    },
+                    schedule: ScheduleMeta {
+                        volatility,
+                        centrality: 1.0,
+                        last_verified: now,
+                        variance_at_verify: INGEST_VARIANCE,
+                        priority: 0.0,
+                    },
+                    // A `--ground` hint lands as a draft binding (no verifier,
+                    // unchecked); it does not move groundedness.
+                    grounds: draft_ground.into_iter().collect(),
+                    provenance: Provenance {
+                        ingested_by: whoami(),
+                        ingested_at: now,
+                    },
+                };
+                self.write_fact(&fact)?;
+                if recompute_centrality {
+                    self.recompute_centrality()?;
+                }
+                self.commit(&tag, &claim.key())?;
+                Ok(id)
+            }
+
+            WriteOp::Ground {
+                fact: id, binding, ..
+            } => {
+                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let detail = format!(
+                    "{} <- {}",
+                    fact.claim.key(),
+                    crate::ground::render_ground(&binding)
+                );
+                fact.grounds.push(binding);
+                self.write_fact(&fact)?;
+                self.commit(&tag, &detail)?;
+                Ok(id)
+            }
+
+            WriteOp::GroundCheck {
+                fact: id,
+                ground,
+                outcome,
+                by,
+                resolved,
+                set_update,
+                observed_cost,
+                ..
+            } => {
+                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let now = Utc::now();
+                let net = fact.grounds.get(ground).is_some_and(GroundBinding::is_net);
+
+                // Record the replay state on the ground that was checked.
+                if let (Some(g), Some(r)) = (fact.grounds.get_mut(ground), resolved.clone()) {
+                    g.last = Some(r);
+                }
+                // Set-valued facts: replace elements with the diffed set (Step 9).
+                if let Some(elements) = set_update {
+                    fact.value = FactValue::Set { elements };
+                }
+
+                if outcome.updates_belief() {
+                    let prior_var = decayed_variance(&fact, now, &self.config);
+                    let prior = crate::decay::decayed_confidence(&fact, now, &self.config);
+                    let confirmed = outcome == Outcome::Confirmed;
+                    let (conf, var) = kalman_update(prior, prior_var, confirmed, net);
+                    fact.epistemics.confidence = conf;
+                    fact.schedule.last_verified = now;
+                    fact.schedule.variance_at_verify = var;
+                    self.append_calibration(&CalibrationSample {
+                        prior,
+                        grounded_outcome: confirmed,
+                    })?;
+                }
+                // Record the measured run time for the generator that produced
+                // this check, so VoI can use a quantile instead of the static
+                // estimate (Idea 2). Only generator/handler sources carry a hash.
+                if let (Some(h), Some(secs)) = (&by, observed_cost) {
+                    self.record_cost(h, secs)?;
+                }
+                // Recompute groundedness from ALL grounds: independent grounds
+                // that split between confirm and refute -> Conflicted (DESIGN §7).
+                fact.epistemics.groundedness = aggregate_groundedness(&fact);
+
+                self.write_fact(&fact)?;
+                if recompute_centrality {
+                    self.recompute_centrality()?;
+                }
+                let by = resolved
+                    .as_ref()
+                    .and_then(|r| r.by.as_ref().map(ToString::to_string))
+                    .unwrap_or_else(|| "existence".to_string());
+                self.commit(&tag, &format!("{} #{ground} {by}", fact.claim.key()))?;
+                Ok(id)
+            }
+
+            WriteOp::Reschedule {
+                fact: id,
+                new_priority,
+                ..
+            } => {
+                let mut fact = self.read_fact(&id, Rev::Working)?;
+                fact.schedule.priority = new_priority;
+                self.write_fact(&fact)?;
+                self.commit(&tag, &fact.claim.key())?;
+                Ok(id)
+            }
+
+            WriteOp::ManualOverride {
+                fact: id,
+                set,
+                reason,
+                ..
+            } => {
+                let mut fact = self.read_fact(&id, Rev::Working)?;
+                fact.epistemics = set;
+                self.write_fact(&fact)?;
+                self.commit(&tag, &format!("{} :: {}", fact.claim.key(), reason))?;
+                Ok(id)
+            }
+        }
     }
 }
 

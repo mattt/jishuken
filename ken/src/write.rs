@@ -20,6 +20,7 @@
 //!     by: None,
 //!     resolved: None,
 //!     set_update: None,
+//!     observed_cost: None,
 //! };
 //! ```
 
@@ -76,6 +77,9 @@ pub enum WriteOp {
         /// For set-valued facts: the merged element list after diffing the
         /// returned set. `None` for scalar facts.
         set_update: Option<Vec<Element>>,
+        /// Wall-clock seconds the read took, folded into the generator's cost
+        /// sketch (DESIGN §7, Idea 2). `None` when there is nothing to measure.
+        observed_cost: Option<f64>,
         _auth: ControlToken,
     },
 

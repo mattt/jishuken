@@ -212,23 +212,34 @@ fn two_independent_grounds_disagree_conflict() {
     assert!(conflicts.iter().any(|id| id.0 == "auth.handler"));
 }
 
-/// A scheduler tick checks grounded, due facts.
+/// A scheduler tick checks grounded, due facts, and coalesces the centrality
+/// recompute into a single `[Centrality]` op for the whole tick (Idea 1),
+/// rather than one per check.
 #[test]
 fn tick_checks_grounded_facts() {
     let Some((_dir, store)) = fresh_store() else {
         return;
     };
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
-    ingest(&store, "thing.exists", "present", Volatility::Hours);
-    ground_file(
-        &store,
-        "thing.exists",
-        "store:d.txt?q=\"present\"",
-        "exists",
-    );
+    for key in ["thing.exists", "other.exists", "third.exists"] {
+        ingest(&store, key, "present", Volatility::Hours);
+        ground_file(&store, key, "store:d.txt?q=\"present\"", "exists");
+    }
 
     let results = engine::tick(&store).unwrap();
     assert!(results.iter().any(|(k, _)| k == "thing.exists"));
+
+    // Multiple facts were checked, but the tick recomputed centrality once.
+    let centrality_ops = store
+        .change_log()
+        .unwrap()
+        .into_iter()
+        .filter(|o| o.description.contains("[Centrality]"))
+        .count();
+    assert!(
+        centrality_ops <= 1,
+        "tick should coalesce to at most one [Centrality] op, got {centrality_ops}"
+    );
 }
 
 /// A `contains` predicate over a File source judges the span against the claim.
