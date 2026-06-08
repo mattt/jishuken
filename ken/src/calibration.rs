@@ -37,6 +37,66 @@ impl Recalibrator {
     }
 }
 
+/// Mean squared error between predicted priors and binary outcomes.
+pub fn brier_score(samples: &[CalibrationSample]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = samples
+        .iter()
+        .map(|s| {
+            let y = if s.grounded_outcome { 1.0 } else { 0.0 };
+            (s.prior - y).powi(2)
+        })
+        .sum();
+    sum / samples.len() as f64
+}
+
+/// Reliability diagram bins: equal-width intervals over [0, 1].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReliabilityBin {
+    pub bin_center: f64,
+    pub mean_predicted: f64,
+    pub mean_observed: f64,
+    pub count: usize,
+}
+
+/// Bucket samples into `num_bins` equal-width intervals; empty bins omitted.
+pub fn reliability_bins(samples: &[CalibrationSample], num_bins: usize) -> Vec<ReliabilityBin> {
+    if samples.is_empty() || num_bins == 0 {
+        return vec![];
+    }
+    let mut bins: Vec<Vec<&CalibrationSample>> = vec![vec![]; num_bins];
+    for s in samples {
+        let slot = (s.prior.clamp(0.0, 1.0) * num_bins as f64).floor();
+        let idx = (slot as usize).min(num_bins.saturating_sub(1));
+        bins[idx].push(s);
+    }
+    bins.into_iter()
+        .enumerate()
+        .filter_map(|(i, bin)| {
+            let count = bin.len();
+            if count == 0 {
+                return None;
+            }
+            let mean_predicted =
+                bin.iter().map(|s| s.prior).sum::<f64>() / count as f64;
+            let mean_observed = bin
+                .iter()
+                .filter(|s| s.grounded_outcome)
+                .count() as f64
+                / count as f64;
+            Some(ReliabilityBin {
+                bin_center: (i as f64 + 0.5) / num_bins as f64,
+                mean_predicted,
+                mean_observed,
+                count,
+            })
+        })
+        .collect()
+}
+
 /// Fit a Platt map by gradient descent on log-loss. Needs a handful of samples;
 /// below that it returns the identity map (DESIGN §8: regenerable, refit freely).
 pub fn recalibrate(samples: &[CalibrationSample]) -> Recalibrator {
@@ -88,6 +148,38 @@ mod tests {
         let r = recalibrate(&samples);
         assert!(r.apply(0.9) < 0.9, "hot prior should be discounted");
         assert!(r.apply(0.9) < 0.6);
+    }
+
+    #[test]
+    fn brier_score_perfect_is_zero() {
+        let samples = vec![
+            CalibrationSample {
+                prior: 1.0,
+                grounded_outcome: true,
+            },
+            CalibrationSample {
+                prior: 0.0,
+                grounded_outcome: false,
+            },
+        ];
+        assert!((brier_score(&samples) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reliability_bins_cover_samples() {
+        let samples = vec![
+            CalibrationSample {
+                prior: 0.1,
+                grounded_outcome: false,
+            },
+            CalibrationSample {
+                prior: 0.9,
+                grounded_outcome: true,
+            },
+        ];
+        let bins = reliability_bins(&samples, 10);
+        assert_eq!(bins.len(), 2);
+        assert_eq!(bins.iter().map(|b| b.count).sum::<usize>(), 2);
     }
 
     #[test]

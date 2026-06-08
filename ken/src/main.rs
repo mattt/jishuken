@@ -11,6 +11,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 
+use ken::calibration::{brier_score, recalibrate, reliability_bins};
 use ken::decay::{decayed_confidence, half_life_secs};
 use ken::engine;
 use ken::ground::locator::parse_source;
@@ -118,6 +119,14 @@ enum Command {
 
     /// Run the data-plane MCP server over stdio.
     Mcp,
+
+    /// Print calibration metrics from the verification log.
+    Calibration {
+        #[arg(long, default_value_t = 10)]
+        bins: usize,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]
@@ -253,6 +262,41 @@ fn run() -> anyhow::Result<()> {
             uninstall_launch_agent,
         )?,
         Command::Mcp => mcp::serve(store.root().to_path_buf())?,
+        Command::Calibration { bins, json } => cmd_calibration(&store, bins, json)?,
+    }
+    Ok(())
+}
+
+fn cmd_calibration(store: &JjStore, bins: usize, json: bool) -> anyhow::Result<()> {
+    let samples = store.calibration_samples()?;
+    let brier = brier_score(&samples);
+    let reliability = reliability_bins(&samples, bins);
+    let recalibrator = recalibrate(&samples);
+
+    if json {
+        let out = serde_json::json!({
+            "sampleCount": samples.len(),
+            "brierScore": brier,
+            "reliabilityBins": reliability,
+            "recalibrator": { "a": recalibrator.a, "b": recalibrator.b },
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("calibration samples: {}", samples.len());
+    println!("brier score:         {brier:.4}");
+    println!("recalibrator:        a={:.4} b={:.4}", recalibrator.a, recalibrator.b);
+    if reliability.is_empty() {
+        println!("reliability bins:    (none)");
+    } else {
+        println!("reliability bins:");
+        for b in reliability {
+            println!(
+                "  center={:.2}  predicted={:.3}  observed={:.3}  n={}",
+                b.bin_center, b.mean_predicted, b.mean_observed, b.count
+            );
+        }
     }
     Ok(())
 }
