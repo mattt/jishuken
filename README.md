@@ -404,6 +404,115 @@ A handler mount is code, so it counts at the generator's tier:
 its source and capabilities fold into one content hash, a change in either is a loud diff and a re-ground,
 and a net handler discounts the gain like any non-deterministic channel.
 
+## Implementation Details
+
+The qualitative model has a small amount of standard math under it.
+Each fact carries a scalar belief that is filtered like a noisy measurement,
+ranked for attention by expected value,
+weighted for consequence by a centrality that resists injection,
+and used to grade the triage that produced it.
+
+### Confidence is a one-dimensional Kalman filter
+
+A fact's confidence $c \in [0,1]$ is a state estimate with a variance $v$,
+and verification is the measurement that corrects it.
+
+Between checks the estimate is predicted forward.
+Confidence relaxes toward maximal ignorance $c_\infty = 0.5$ at the fact's volatility half-life $h$,
+and its variance grows by process noise $Q$ per unit time:
+
+$$
+c(\Delta t) = c_\infty + (c_0 - c_\infty)\,2^{-\Delta t / h},
+\qquad
+v(\Delta t) = v_0 + Q\,\Delta t,
+\qquad
+Q = \frac{\ln 2}{h}.
+$$
+
+The `immutable` class sets $Q = 0$ and never decays;
+`hours`, `days`, and `slow` set successively longer half-lives.
+
+A ground check is a measurement $z$, with $z = 1$ for a confirmation and $z = 0$ for a refutation.
+The correction is the scalar Kalman step:
+
+$$
+K = \frac{v}{v + R},
+\qquad
+c \leftarrow c + K\,(z - c),
+\qquad
+v \leftarrow (1 - K)\,v.
+$$
+
+The gain $K$ carries the intuition.
+A fresh, confident fact has low variance, so $K$ is small and new evidence barely moves it;
+a stale fact has had its variance inflated by $Q\,\Delta t$, so $K$ is large and it flips on weak evidence.
+The measurement noise $R$ says how much to trust the channel:
+a deterministic local read uses $R = 0.05$,
+and a non-deterministic one (a command, or a net-capable generator or handler) uses $R = 0.30$,
+so the same confirmation moves confidence less when it arrived over a channel that can lie.
+That is the "counts for less" from the model, as a number.
+
+### Scheduling by value of information
+
+A tick ranks every checkable fact by the expected value of checking it,
+the probability it is wrong times its consequence, divided by what the check costs:
+
+$$
+\mathrm{VoI}(f) = \frac{\big(1 - c(\Delta t)\big)\,\kappa_f}{\mathrm{cost}_f},
+$$
+
+where $\kappa_f$ is the fact's centrality (below) and $c(\Delta t)$ is its decayed confidence.
+The top `per_tick` facts are checked.
+Cost is measured rather than guessed:
+each generator's run times are folded into a t-digest, and the scheduler uses its median,
+falling back to a static estimate until there are samples.
+
+Pure value of information never revisits what it is already sure of,
+so a small exploration floor sits on top.
+Each confident fact is audited with probability
+
+$$
+p_{\text{audit}}(f) = \min\!\big(1,\ \varepsilon\,\kappa_f\big),
+$$
+
+drawn deterministically from the fact id and the tick clock,
+and routed through an independent ground rather than the one that last certified it,
+so a wrong verifier cannot keep confirming itself.
+
+### Consequence is trust-weighted Katz centrality
+
+Consequence $\kappa$ is Katz centrality over the graph of facts and the entities they touch:
+
+$$
+\kappa = \beta\,\mathbf{1} + \alpha\,A^{\top} W \kappa,
+$$
+
+solved by power iteration with $\alpha = 0.5$ and $\beta = 1$.
+The difference from textbook Katz is the diagonal weight matrix $W$.
+Each node contributes to importance only in proportion to its own groundedness:
+$w_i = 0$ for an ungrounded fact, $0.5$ for one in conflict, and $1$ for a verified one.
+An attacker who injects a cluster of facts pointing at a target to inflate its budget gains nothing,
+because the injected, unverified nodes carry weight $0$ until they clear their own verification.
+The control plane stays robust to data-plane injection by construction.
+
+### Self-calibration of the triage
+
+Every confirmed or refuted check logs the pair $(p, z)$:
+the prior confidence the fact carried, and whether it held up.
+Those pairs grade the LLM triage that assigned the priors.
+When the priors run hot, a one-dimensional Platt map is fit by gradient descent on log-loss
+and applied to future ingests:
+
+$$
+r(p) = \sigma\!\big(4a\,(p - 0.5) + b\big),
+\qquad
+\sigma(x) = \frac{1}{1 + e^{-x}}.
+$$
+
+The map is the identity until a handful of samples exist, and it is regenerable:
+if the calibration log is lost or poisoned, refit it.
+A miscalibrated prior is cheap, because it changes only the order of verification, never a fact's groundedness.
+
 ## Configuration
 
 `ken.toml`, in the store root:
