@@ -17,7 +17,9 @@ use ken::ground::locator::parse_source;
 use ken::ground::{ground_source_for, render_ground};
 use ken::predicate::Predicate;
 use ken::scheduler;
-use ken::schema::{Claim, Fact, FactValue, GroundBinding, Groundedness, TriageSource, Volatility};
+use ken::schema::{
+    Claim, Fact, FactValue, GroundBinding, Groundedness, Outcome, TriageSource, Volatility,
+};
 use ken::store::{JjStore, VersionedStore};
 use ken::write::WriteOp;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -52,11 +54,19 @@ This is ken's data plane. You can recall, search, and ingest, and browse facts a
 resources. You cannot verify, ground, override belief, or grant capabilities here, \
 by design, so that ingesting an untrusted page can never mark a fact verified. An \
 ingested fact always lands `ungrounded`; name where it should be checked with the \
-`ground` hint so the scheduler can verify it later.
+`ground` hint so the scheduler can verify it later. If you confirm against a live \
+source that a stored value has changed, re-ingest the corrected value with a `ground` \
+hint: it lands `ungrounded`, which raises its re-verification priority for the next \
+scheduler tick. That is how you flag a stale fact; you cannot mark it verified yourself.
+
+Recall takes an exact `entity.relation` key; use search for free text. Search \
+tokenizes the query, so multi-word queries match. `conflicts` is a single fact whose \
+grounds disagree, not a disagreement across two facts.
 
 Resources: `ken://fact/<entity.relation>` is a fact with full epistemics, \
-`ken://why/<entity.relation>` is its provenance, `ken://conflicts` lists facts \
-holding two answers, and `ken://stale` ranks the facts most worth re-checking.";
+`ken://why/<entity.relation>` is its provenance, `ken://conflicts` lists facts whose \
+grounds disagree (and facts with a refuted ground not yet in full conflict), and \
+`ken://stale` ranks the facts most worth re-checking.";
 
 #[derive(Clone)]
 pub struct KenServer {
@@ -160,11 +170,13 @@ impl KenServer {
         Parameters(p): Parameters<RecallParams>,
     ) -> Result<Json<RecallOutput>, String> {
         let store = self.open()?;
-        recall_output(&store, &p.key).map(Json)
+        recall_output(&store, &p.key)
+            .map(Json)
+            .map_err(|e| recall_hint(&store, &p.key, &e))
     }
 
     #[tool(
-        description = "Remember a fact. Always lands ungrounded (a belief, not a checked truth). Name where it should be checked with `ground`. Returns the fact id.",
+        description = "Remember a fact. Always lands ungrounded (a belief, not a checked truth). Name where it should be checked with `ground`. Returns the fact id. Re-ingesting an existing key supersedes its value and lands ungrounded again, which raises its re-verification priority for the next scheduler tick: the data-plane way to flag a fact you have seen change.",
         annotations(
             title = "Remember a fact",
             read_only_hint = false,
@@ -219,7 +231,7 @@ impl KenServer {
     }
 
     #[tool(
-        description = "Find facts by entity, relation, text, or groundedness. Returns each match plus a resource link to its full epistemics.",
+        description = "Find facts by entity, relation, text, or groundedness. The text query is tokenized on whitespace and ranked by how many tokens match key or value, so broad multi-word queries work. Returns each match plus a resource link to its full epistemics.",
         annotations(
             title = "Search facts",
             read_only_hint = true,
@@ -233,15 +245,10 @@ impl KenServer {
     ) -> Result<CallToolResult, String> {
         let store = self.open()?;
         let now = chrono::Utc::now();
-        let query = p.query.to_lowercase();
+        let tokens = query_tokens(&p.query);
         let facts = store.all_facts().map_err(|e| e.to_string())?;
-        let hits: Vec<&Fact> = facts
+        let mut ranked: Vec<(usize, &Fact)> = facts
             .iter()
-            .filter(|f| {
-                query.is_empty()
-                    || f.claim.key().to_lowercase().contains(&query)
-                    || f.value.render().to_lowercase().contains(&query)
-            })
             .filter(|f| p.entity.as_ref().is_none_or(|e| &f.claim.entity.0 == e))
             .filter(|f| p.relation.as_ref().is_none_or(|r| &f.claim.relation == r))
             .filter(|f| {
@@ -249,7 +256,19 @@ impl KenServer {
                     .as_ref()
                     .is_none_or(|g| f.epistemics.groundedness.label() == g.to_lowercase())
             })
+            .filter_map(|f| {
+                if tokens.is_empty() {
+                    return Some((0usize, f));
+                }
+                let matched = hit_score(&f.claim.key(), &f.value.render(), &tokens);
+                (matched > 0).then_some((matched, f))
+            })
             .collect();
+        // Rank by how many query tokens a fact matches; filesystem order breaks
+        // ties. Tokenizing is what lets a broad query ("free orders webhook")
+        // match facts that no contiguous substring would.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        let hits: Vec<&Fact> = ranked.into_iter().map(|(_, f)| f).collect();
 
         let matches: Vec<Value> = hits
             .iter()
@@ -286,7 +305,7 @@ impl KenServer {
     }
 
     #[tool(
-        description = "List facts currently holding two disagreeing answers.",
+        description = "List facts whose grounds disagree: `conflicts` (one fact with one ground confirmed and another refuted) and `distrusted` (a fact carrying a refuted ground that has not yet aggregated to full conflict). Disagreements across different facts are not surfaced here.",
         annotations(
             title = "List conflicts",
             read_only_hint = true,
@@ -333,12 +352,35 @@ fn recall_output(store: &JjStore, key: &str) -> Result<RecallOutput, String> {
 fn conflicts_value(store: &JjStore) -> Result<Value, String> {
     let ids = store.list_conflicts().map_err(|e| e.to_string())?;
     let facts = store.all_facts().map_err(|e| e.to_string())?;
-    let conflicts: Vec<Value> = facts
-        .into_iter()
-        .filter(|f| ids.contains(&f.id))
-        .map(|f| json!({ "key": f.claim.key(), "value": f.value.render() }))
-        .collect();
-    Ok(json!({ "conflicts": conflicts }))
+    let mut conflicts = Vec::new();
+    let mut distrusted = Vec::new();
+    for f in &facts {
+        if ids.contains(&f.id) {
+            conflicts.push(json!({ "key": f.claim.key(), "value": f.value.render() }));
+            continue;
+        }
+        // A ground was refuted but the fact has not aggregated to `conflicted`
+        // (e.g. only one of several grounds has been checked). Surface it so a
+        // half-checked disagreement is not invisible to the agent.
+        let refuted: Vec<String> = f
+            .grounds
+            .iter()
+            .filter(|g| {
+                g.last
+                    .as_ref()
+                    .is_some_and(|r| matches!(r.outcome, Outcome::Refuted))
+            })
+            .map(render_ground)
+            .collect();
+        if !refuted.is_empty() {
+            distrusted.push(json!({
+                "key": f.claim.key(),
+                "value": f.value.render(),
+                "refuted_grounds": refuted,
+            }));
+        }
+    }
+    Ok(json!({ "conflicts": conflicts, "distrusted": distrusted }))
 }
 
 /// Facts ranked by value of information (DESIGN §7): the ones most likely to be
@@ -452,6 +494,70 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+// --- search and recall-suggestion helpers (pure, unit-tested below) ---
+
+/// Lowercase whitespace tokens of a free-text query.
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// How many query tokens appear, as substrings, in a fact's key or value.
+fn hit_score(key: &str, value: &str, tokens: &[String]) -> usize {
+    let hay = format!("{} {}", key.to_lowercase(), value.to_lowercase());
+    tokens.iter().filter(|t| hay.contains(t.as_str())).count()
+}
+
+/// How many alphanumeric tokens of `query` appear in a candidate key. Drives
+/// the "did you mean" suggestions when a recall misses.
+fn key_overlap(candidate_key: &str, query: &str) -> usize {
+    let key = candidate_key.to_lowercase();
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .filter(|t| key.contains(t))
+        .count()
+}
+
+/// The existing keys most similar to `query`, by token overlap, best first.
+fn nearest_keys(store: &JjStore, query: &str, limit: usize) -> Vec<String> {
+    let Ok(facts) = store.all_facts() else {
+        return Vec::new();
+    };
+    let mut ranked: Vec<(usize, String)> = facts
+        .iter()
+        .map(|f| (key_overlap(&f.claim.key(), query), f.claim.key()))
+        .filter(|(overlap, _)| *overlap > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    ranked.truncate(limit);
+    ranked.into_iter().map(|(_, k)| k).collect()
+}
+
+/// Turn a bare recall failure into an actionable message: name the likely
+/// mistake and point at `ken_search`, with the closest existing keys.
+fn recall_hint(store: &JjStore, key: &str, err: &str) -> String {
+    use std::fmt::Write as _;
+    let mut msg = format!("{err}. ");
+    if !key.contains('.') {
+        msg.push_str(
+            "Keys are `entity.relation` (e.g. `staging.url`), not free text; \
+             use `ken_search` for text queries. ",
+        );
+    }
+    let suggestions = nearest_keys(store, key, 5);
+    if suggestions.is_empty() {
+        msg.push_str("No similar keys are in the store.");
+    } else {
+        let _ = write!(msg, "Did you mean: {}?", suggestions.join(", "));
+    }
+    msg
+}
+
 // --- prompts: the "how to remember well" conventions, shipped as templates ---
 
 const PROMPT_REMEMBER: &str = "remember";
@@ -512,7 +618,9 @@ fn prompt_messages(
                  checked against a real source, and a conflicted fact holds two answers, so \
                  surface the disagreement rather than picking one. Prefer recently verified, \
                  high-confidence facts; treat stale or ungrounded ones as leads to confirm, \
-                 not as settled truth."
+                 not as settled truth. If you confirm against a live source that a stored \
+                 value has changed, re-ingest the corrected value with a ground hint so the \
+                 scheduler re-verifies it; you cannot mark it verified yourself."
             )
         }
         _ => return None,
@@ -698,4 +806,186 @@ pub fn serve(store_path: PathBuf) -> anyhow::Result<()> {
         service.waiting().await?;
         anyhow::Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hit_score, key_overlap, query_tokens};
+    use super::{IngestParams, KenServer, RecallParams, SearchParams};
+    use ken::store::{jj_available, JjStore};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    fn ingest_params(key: &str, value: &str) -> IngestParams {
+        IngestParams {
+            key: key.to_string(),
+            value: value.to_string(),
+            volatility: None,
+            meta_confidence: None,
+            ground: None,
+        }
+    }
+
+    /// Drive the served tool surface end to end against a real jj store:
+    /// ingest -> tokenized search -> recall (hit and actionable miss) ->
+    /// conflicts with the `distrusted` section. Control-plane fixture state is
+    /// created through `ken::engine` (the same path the CLI uses); the served
+    /// surface itself stays data-plane only.
+    #[test]
+    fn tool_surface_roundtrip_against_real_store() {
+        if !jj_available() {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".ken");
+        let store = JjStore::init(&root).unwrap();
+        let server = KenServer {
+            store_path: root.clone(),
+        };
+
+        // Data plane: ingest three facts through the tool.
+        for (key, value) in [
+            ("plan.free_orders_limit", "100"),
+            ("checkout.v2_enabled", "false"),
+            ("auth.handler", "auth lives here"),
+        ] {
+            let out = server
+                .ken_ingest(Parameters(ingest_params(key, value)))
+                .unwrap();
+            assert!(out.contains("ungrounded"), "ingest lands ungrounded: {out}");
+        }
+
+        // Tokenized search: no contiguous substring of any key or value matches
+        // this query; token hits must carry it.
+        let result = server
+            .ken_search(Parameters(SearchParams {
+                query: "free orders limit".to_string(),
+                entity: None,
+                relation: None,
+                grounded: None,
+            }))
+            .unwrap();
+        let text = format!("{result:?}");
+        assert!(
+            text.contains("plan.free_orders_limit"),
+            "tokenized search should hit: {text}"
+        );
+
+        // Recall hit: exact key returns full epistemics.
+        let recalled = server
+            .ken_recall(Parameters(RecallParams {
+                key: "plan.free_orders_limit".to_string(),
+            }))
+            .unwrap();
+        assert_eq!(recalled.0.key, "plan.free_orders_limit");
+        assert_eq!(recalled.0.groundedness.state, "ungrounded");
+
+        // Recall miss with a free-text query: the error must name the mistake,
+        // point at ken_search, and suggest the nearest key.
+        let Err(err) = server.ken_recall(Parameters(RecallParams {
+            key: "free orders limit".to_string(),
+        })) else {
+            panic!("free-text recall should miss");
+        };
+        assert!(err.contains("ken_search"), "error should redirect: {err}");
+        assert!(
+            err.contains("plan.free_orders_limit"),
+            "error should suggest the nearest key: {err}"
+        );
+
+        // Control-plane fixtures: one fact with a lone refuted ground
+        // (distrusted), one with grounds that disagree (conflicted).
+        std::fs::write(store.root().join("src.txt"), "auth lives here").unwrap();
+        ground(
+            &store,
+            "checkout.v2_enabled",
+            "store:src.txt?q=\"enabled = true\"",
+        );
+        ground(
+            &store,
+            "auth.handler",
+            "store:src.txt?q=\"auth lives here\"",
+        );
+        ground(
+            &store,
+            "auth.handler",
+            "store:src.txt?q=\"moved elsewhere\"",
+        );
+
+        let conflicts = server.ken_conflicts().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&conflicts).unwrap();
+        let conflicted: Vec<&str> = parsed["conflicts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["key"].as_str())
+            .collect();
+        assert!(
+            conflicted.contains(&"auth.handler"),
+            "disagreeing grounds should conflict: {conflicts}"
+        );
+        let distrusted: Vec<&str> = parsed["distrusted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["key"].as_str())
+            .collect();
+        assert!(
+            distrusted.contains(&"checkout.v2_enabled"),
+            "a lone refuted ground should surface as distrusted: {conflicts}"
+        );
+    }
+
+    fn ground(store: &JjStore, key: &str, source: &str) {
+        let (src, locator) = ken::ground::locator::parse_source(source, None).unwrap();
+        let binding = ken::schema::GroundBinding {
+            source: ken::schema::GroundSource::File(src),
+            locator,
+            predicate: ken::predicate::Predicate::Exists,
+            last: None,
+        };
+        ken::engine::ground(store, key, binding).unwrap();
+    }
+
+    #[test]
+    fn query_tokens_lowercases_and_splits() {
+        assert_eq!(
+            query_tokens("Free Orders Limit"),
+            ["free", "orders", "limit"]
+        );
+        assert!(query_tokens("   ").is_empty());
+    }
+
+    #[test]
+    fn hit_score_counts_matching_tokens_across_key_and_value() {
+        let tokens = query_tokens("free orders webhook");
+        // key matches "free" and "orders"; "webhook" matches neither key nor value.
+        assert_eq!(hit_score("plan.free_orders_limit", "50", &tokens), 2);
+        assert_eq!(
+            hit_score("plan.free_orders_limit", "50", &query_tokens("nope")),
+            0
+        );
+    }
+
+    #[test]
+    fn hit_score_matches_tokens_in_value() {
+        let tokens = query_tokens("postgres");
+        assert_eq!(hit_score("db.engine", "Postgres 16", &tokens), 1);
+    }
+
+    #[test]
+    fn key_overlap_ranks_a_broad_query_above_an_unrelated_key() {
+        let q = "free orders limit checkout webhook";
+        assert_eq!(key_overlap("plan.free_orders_limit", q), 3);
+        assert_eq!(key_overlap("staging.url", q), 0);
+    }
+
+    #[test]
+    fn key_overlap_ignores_punctuation_in_the_query() {
+        // Splits on the dot and underscores: plan, free, orders, limit.
+        assert_eq!(
+            key_overlap("plan.free_orders_limit", "plan.free_orders_limit"),
+            4
+        );
+    }
 }
