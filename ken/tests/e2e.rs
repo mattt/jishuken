@@ -417,6 +417,116 @@ fn handler_scheme_grounds_with_locator_projection() {
     );
 }
 
+/// Run the ken binary against a store and return stdout, asserting success.
+fn ken_cli(store: &JjStore, args: &[&str]) -> String {
+    let mut full = vec!["--store", store.root().to_str().unwrap()];
+    full.extend_from_slice(args);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
+        .args(&full)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ken {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The full CLI loop a user runs: `add` -> `ground` -> `verify` -> `recall`.
+/// The control plane moves groundedness; the recall carries the epistemics.
+#[test]
+fn cli_ground_verify_recall_roundtrip() {
+    let Some((_dir, store)) = fresh_store() else {
+        return;
+    };
+    std::fs::write(store.root().join("cfg.txt"), "port = 8080").unwrap();
+
+    ken_cli(&store, &["add", "svc.port", "8080", "--volatility", "days"]);
+    let out = ken_cli(
+        &store,
+        &[
+            "ground",
+            "svc.port",
+            "--source",
+            "store:cfg.txt?q=\"port = 8080\"",
+        ],
+    );
+    assert!(out.contains("verified"), "ground should verify: {out}");
+
+    let out = ken_cli(&store, &["verify", "svc.port"]);
+    assert!(out.contains("verified"), "re-verify should hold: {out}");
+
+    let out = ken_cli(&store, &["recall", "svc.port", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["value"], "8080");
+    assert_eq!(parsed["groundedness"]["state"], "verified");
+}
+
+/// `ken tick` over the binary checks due grounded facts and reports outcomes.
+#[test]
+fn cli_tick_checks_due_facts() {
+    let Some((_dir, store)) = fresh_store() else {
+        return;
+    };
+    std::fs::write(store.root().join("d.txt"), "present").unwrap();
+    ken_cli(
+        &store,
+        &["add", "thing.exists", "present", "--volatility", "hours"],
+    );
+    ken_cli(
+        &store,
+        &[
+            "ground",
+            "thing.exists",
+            "--source",
+            "store:d.txt?q=\"present\"",
+        ],
+    );
+
+    let out = ken_cli(&store, &["tick"]);
+    assert!(
+        out.contains("thing.exists") || out.contains("nothing due"),
+        "tick should report the checked fact or an empty queue: {out}"
+    );
+}
+
+/// `ken calibration` reports the samples that ground checks accumulated.
+#[test]
+fn cli_calibration_reports_accumulated_samples() {
+    let Some((_dir, store)) = fresh_store() else {
+        return;
+    };
+    std::fs::write(store.root().join("a.txt"), "value present").unwrap();
+    ken_cli(&store, &["add", "one.fact", "value present"]);
+    ken_cli(
+        &store,
+        &[
+            "ground",
+            "one.fact",
+            "--source",
+            "store:a.txt?q=\"value present\"",
+        ],
+    );
+    // A refuted check logs a second sample.
+    ken_cli(&store, &["add", "two.fact", "absent value"]);
+    ken_cli(
+        &store,
+        &[
+            "ground",
+            "two.fact",
+            "--source",
+            "store:a.txt?q=\"no such span\"",
+        ],
+    );
+
+    let out = ken_cli(&store, &["calibration", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let count = parsed["sampleCount"].as_u64().unwrap();
+    assert!(count >= 2, "ground checks should log samples: {out}");
+    assert!(parsed["brierScore"].is_number());
+}
+
 /// `ken search` over the binary lists facts and honors the groundedness filter.
 #[test]
 fn search_binary_lists_and_filters() {
