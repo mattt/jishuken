@@ -109,10 +109,10 @@ enum Command {
         /// Run a single tick and exit.
         #[arg(long)]
         once: bool,
-        /// Install a macOS launch agent targeting this store and exit.
+        /// Install and load a launch agent for this store, then exit (macOS only).
         #[arg(long)]
         install_launch_agent: bool,
-        /// Remove the macOS launch agent for this store and exit.
+        /// Unload and remove the launch agent for this store, then exit (macOS only).
         #[arg(long)]
         uninstall_launch_agent: bool,
     },
@@ -286,7 +286,10 @@ fn cmd_calibration(store: &JjStore, bins: usize, json: bool) -> anyhow::Result<(
 
     println!("calibration samples: {}", samples.len());
     println!("brier score:         {brier:.4}");
-    println!("recalibrator:        a={:.4} b={:.4}", recalibrator.a, recalibrator.b);
+    println!(
+        "recalibrator:        a={:.4} b={:.4}",
+        recalibrator.a, recalibrator.b
+    );
     if reliability.is_empty() {
         println!("reliability bins:    (none)");
     } else {
@@ -711,22 +714,32 @@ fn cmd_serve(
     install: bool,
     uninstall: bool,
 ) -> anyhow::Result<()> {
-    if install {
-        let path = launch_agent::install(store.root())?;
-        println!("installed launch agent at {}", path.display());
-        return Ok(());
+    #[cfg(target_os = "macos")]
+    {
+        if install {
+            let path = launch_agent::install(store.root())?;
+            println!("installed and loaded launch agent at {}", path.display());
+            return Ok(());
+        }
+        if uninstall {
+            let removed = launch_agent::uninstall(store.root())?;
+            println!(
+                "{}",
+                if removed {
+                    "removed launch agent"
+                } else {
+                    "no launch agent installed"
+                }
+            );
+            return Ok(());
+        }
     }
-    if uninstall {
-        let removed = launch_agent::uninstall(store.root())?;
-        println!(
-            "{}",
-            if removed {
-                "removed launch agent"
-            } else {
-                "no launch agent installed"
-            }
+    #[cfg(not(target_os = "macos"))]
+    if install || uninstall {
+        anyhow::bail!(
+            "launch agents are a macOS facility; on this platform run \
+             `ken serve` under your service manager (e.g. a systemd unit)"
         );
-        return Ok(());
     }
 
     let secs = interval
@@ -753,24 +766,46 @@ fn cmd_serve(
 
 // --- macOS launch agent ---
 
+#[cfg(target_os = "macos")]
 mod launch_agent {
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     fn label(store_root: &Path) -> String {
         let h = blake3::hash(store_root.to_string_lossy().as_bytes()).to_hex();
         format!("dev.ken.{}", &h[..12])
     }
 
+    fn home() -> anyhow::Result<PathBuf> {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .map_err(|_| anyhow::anyhow!("HOME not set"))
+    }
+
     fn plist_path(store_root: &Path) -> anyhow::Result<PathBuf> {
-        let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
-        Ok(PathBuf::from(home)
+        Ok(home()?
             .join("Library/LaunchAgents")
             .join(format!("{}.plist", label(store_root))))
     }
 
+    /// The current user's launchd GUI domain, e.g. `gui/501`.
+    fn gui_domain() -> anyhow::Result<String> {
+        let out = Command::new("id").arg("-u").output()?;
+        let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if uid.is_empty() {
+            anyhow::bail!("could not determine uid for launchctl domain");
+        }
+        Ok(format!("gui/{uid}"))
+    }
+
+    /// Write the plist and load it with `launchctl bootstrap`. The agent points
+    /// at the current executable, so reinstall after moving the binary.
     pub fn install(store_root: &Path) -> anyhow::Result<PathBuf> {
         let exe = std::env::current_exe()?;
         let label = label(store_root);
+        let log_dir = home()?.join("Library/Logs/ken");
+        std::fs::create_dir_all(&log_dir)?;
+        let log = log_dir.join(format!("{label}.log"));
         let plist = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -786,29 +821,55 @@ mod launch_agent {
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 "#,
             label = label,
             exe = exe.display(),
             store = store_root.display(),
+            log = log.display(),
         );
         let path = plist_path(store_root)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, plist)?;
+
+        // Load it now. Bootout first so a reinstall picks up a moved binary or
+        // changed arguments; ignore failure when nothing was loaded.
+        let domain = gui_domain()?;
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("{domain}/{label}")])
+            .output();
+        let status = Command::new("launchctl")
+            .args(["bootstrap", &domain])
+            .arg(&path)
+            .output()?;
+        if !status.status.success() {
+            anyhow::bail!(
+                "wrote {} but `launchctl bootstrap` failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&status.stderr).trim()
+            );
+        }
         Ok(path)
     }
 
+    /// Unload the agent with `launchctl bootout` and remove its plist.
     pub fn uninstall(store_root: &Path) -> anyhow::Result<bool> {
         let path = plist_path(store_root)?;
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if !path.exists() {
+            return Ok(false);
         }
+        let domain = gui_domain()?;
+        // Best-effort unload; the agent may not be loaded.
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("{}/{}", domain, label(store_root))])
+            .output();
+        std::fs::remove_file(&path)?;
+        Ok(true)
     }
 }
 
