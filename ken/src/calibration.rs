@@ -31,8 +31,18 @@ fn sigmoid(x: f64) -> f64 {
 }
 
 impl Recalibrator {
+    /// True when no fit has moved the map off its default. The docs promise the
+    /// map "is the identity until a handful of samples exist", so the unfitted
+    /// map must pass priors through exactly, not approximately.
+    pub fn is_identity(&self) -> bool {
+        *self == Recalibrator::default()
+    }
+
     pub fn apply(&self, prior: f64) -> f64 {
-        // Center the prior so the default map is close to the identity on [0,1].
+        if self.is_identity() {
+            return prior.clamp(0.0, 1.0);
+        }
+        // Center the prior so the fitted map stays well-conditioned on [0,1].
         sigmoid(self.a * (prior - 0.5) * 4.0 + self.b).clamp(0.0, 1.0)
     }
 }
@@ -70,6 +80,10 @@ pub fn reliability_bins(samples: &[CalibrationSample], num_bins: usize) -> Vec<R
     let mut bins: Vec<Vec<&CalibrationSample>> = vec![vec![]; num_bins];
     for s in samples {
         let slot = (s.prior.clamp(0.0, 1.0) * num_bins as f64).floor();
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "slot is a clamped-to-[0,1] prior scaled and floored, never negative"
+        )]
         let idx = (slot as usize).min(num_bins.saturating_sub(1));
         bins[idx].push(s);
     }
@@ -80,13 +94,9 @@ pub fn reliability_bins(samples: &[CalibrationSample], num_bins: usize) -> Vec<R
             if count == 0 {
                 return None;
             }
-            let mean_predicted =
-                bin.iter().map(|s| s.prior).sum::<f64>() / count as f64;
-            let mean_observed = bin
-                .iter()
-                .filter(|s| s.grounded_outcome)
-                .count() as f64
-                / count as f64;
+            let mean_predicted = bin.iter().map(|s| s.prior).sum::<f64>() / count as f64;
+            let mean_observed =
+                bin.iter().filter(|s| s.grounded_outcome).count() as f64 / count as f64;
             Some(ReliabilityBin {
                 bin_center: (i as f64 + 0.5) / num_bins as f64,
                 mean_predicted,

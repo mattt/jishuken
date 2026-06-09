@@ -21,7 +21,7 @@ use crate::schema::{
     Groundedness, Provenance, ScheduleMeta, Timestamp,
 };
 use crate::sketch::TDigest;
-use crate::write::{landed_confidence, Outcome, WriteOp};
+use crate::write::{landed_confidence_with, Outcome, WriteOp};
 
 /// Which revision to read at. `@` is the working copy.
 #[derive(Debug, Clone)]
@@ -124,8 +124,11 @@ impl JjStore {
     /// Open an existing `.ken/` store at `root`.
     ///
     /// # Errors
-    /// Returns [`Error::StoreNotFound`] if `root` is not a jj-backed store.
+    /// Returns [`Error::StoreNotFound`] if `root` is not a jj-backed store, or
+    /// [`Error::Jj`] if the installed `jj` is missing or older than
+    /// [`JJ_MIN_VERSION`].
     pub fn open(root: &Path) -> Result<JjStore> {
+        ensure_jj_supported()?;
         if !root.join(".jj").is_dir() {
             return Err(Error::StoreNotFound);
         }
@@ -151,9 +154,10 @@ impl JjStore {
     /// Create a `.ken/` store: a jj repo with `ken.toml`, `facts/`, `verifiers/`.
     ///
     /// # Errors
-    /// Returns an error if the directories cannot be created or a `jj`
-    /// invocation fails.
+    /// Returns an error if the directories cannot be created, a `jj` invocation
+    /// fails, or the installed `jj` is missing or older than [`JJ_MIN_VERSION`].
     pub fn init(root: &Path) -> Result<JjStore> {
+        ensure_jj_supported()?;
         std::fs::create_dir_all(root)?;
         // `git init` must not pass `-R` (no repo exists yet to resolve).
         run_jj_raw(root, &["git", "init", "."])?;
@@ -471,12 +475,16 @@ impl JjStore {
             } => {
                 let now = Utc::now();
                 let id = ChangeId::for_claim(&claim);
+                // DESIGN §8: grade the LLM triage that produced this prior. The
+                // Platt map fitted from logged (prior, outcome) pairs is applied
+                // to LLM-triaged confidence; identity until enough samples.
+                let recalibrator = crate::calibration::recalibrate(&self.calibration_samples()?);
                 let fact = Fact {
                     id: id.clone(),
                     claim: claim.clone(),
                     value,
                     epistemics: Epistemics {
-                        confidence: landed_confidence(&triage),
+                        confidence: landed_confidence_with(&triage, &recalibrator),
                         groundedness: Groundedness::Ungrounded { source: triage },
                     },
                     schedule: ScheduleMeta {
@@ -710,4 +718,139 @@ pub fn jj_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Minimum supported `jj` version (the version ken is developed and tested
+/// against). jj's CLI surface moves before 1.0, so the store refuses to run
+/// against an older jj rather than failing obscurely mid-operation.
+pub const JJ_MIN_VERSION: (u32, u32) = (0, 42);
+
+/// Parse `jj --version` output ("jj 0.42.0") into `(major, minor)`.
+fn parse_jj_version(output: &str) -> Option<(u32, u32)> {
+    let rest = output.trim().strip_prefix("jj ")?;
+    let mut parts = rest.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Enforce the jj version pin once per process (the result cannot change while
+/// we run, so this is a perf-only cache).
+fn ensure_jj_supported() -> Result<()> {
+    use std::sync::OnceLock;
+    static CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    CHECK
+        .get_or_init(|| {
+            let (want_major, want_minor) = JJ_MIN_VERSION;
+            let output = Command::new("jj").arg("--version").output().map_err(|e| {
+                format!("jj not found on PATH ({e}); ken requires jj >= {want_major}.{want_minor}")
+            })?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let Some((major, minor)) = parse_jj_version(&text) else {
+                return Err(format!(
+                    "could not parse `jj --version` output {text:?}; ken requires jj >= {want_major}.{want_minor}"
+                ));
+            };
+            if (major, minor) < (want_major, want_minor) {
+                return Err(format!(
+                    "jj {major}.{minor} is older than the supported minimum {want_major}.{want_minor}; \
+                     upgrade jj (ken pins to a supported jj version until jj reaches 1.0)"
+                ));
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(Error::Jj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{aggregate_groundedness, parse_jj_version, parse_log_records};
+    use crate::ground::locator::parse_source;
+    use crate::predicate::Predicate;
+    use crate::schema::{Fact, GroundBinding, GroundSource, Groundedness, Resolved};
+    use crate::test_support::verified_scalar;
+    use crate::write::Outcome;
+    use chrono::Utc;
+
+    #[test]
+    fn parses_jj_version_output() {
+        assert_eq!(parse_jj_version("jj 0.42.0\n"), Some((0, 42)));
+        assert_eq!(parse_jj_version("jj 1.0.3"), Some((1, 0)));
+        assert_eq!(parse_jj_version("garbage"), None);
+        assert_eq!(parse_jj_version(""), None);
+    }
+
+    fn ground_with(outcome: Option<Outcome>) -> GroundBinding {
+        let (src, locator) = parse_source("store:data.txt", None).unwrap();
+        GroundBinding {
+            source: GroundSource::File(src),
+            locator,
+            predicate: Predicate::Exists,
+            last: outcome.map(|outcome| Resolved {
+                rev: String::new(),
+                span_hash: String::new(),
+                at: Utc::now(),
+                outcome,
+                by: None,
+            }),
+        }
+    }
+
+    fn fact_with_grounds(grounds: Vec<GroundBinding>) -> Fact {
+        let mut fact = verified_scalar("svc.url");
+        fact.grounds = grounds;
+        fact
+    }
+
+    #[test]
+    fn confirm_and_refute_aggregate_to_conflicted() {
+        let fact = fact_with_grounds(vec![
+            ground_with(Some(Outcome::Confirmed)),
+            ground_with(Some(Outcome::Refuted)),
+        ]);
+        assert!(matches!(
+            aggregate_groundedness(&fact),
+            Groundedness::Conflicted { .. }
+        ));
+    }
+
+    #[test]
+    fn all_confirm_aggregates_to_verified() {
+        let fact = fact_with_grounds(vec![
+            ground_with(Some(Outcome::Confirmed)),
+            ground_with(Some(Outcome::Confirmed)),
+        ]);
+        assert!(matches!(
+            aggregate_groundedness(&fact),
+            Groundedness::Verified { .. }
+        ));
+    }
+
+    #[test]
+    fn errored_and_unchecked_grounds_do_not_move_groundedness() {
+        // Errored is not a refutation (the channel failed, not the claim), and
+        // a draft binding with no check yet counts for nothing.
+        let mut fact =
+            fact_with_grounds(vec![ground_with(Some(Outcome::Errored)), ground_with(None)]);
+        fact.epistemics.groundedness = Groundedness::Ungrounded {
+            source: crate::schema::TriageSource::Ingest,
+        };
+        assert!(matches!(
+            aggregate_groundedness(&fact),
+            Groundedness::Ungrounded { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_log_records_splits_on_separators() {
+        let us = '\u{1f}';
+        let rs = '\u{1e}';
+        let out =
+            format!("op1{us}t1{us}[Ingest] a.b{rs}op2{us}t2{us}[GroundCheck:confirmed] a.b{rs}");
+        let records = parse_log_records(&out);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].id, "op1");
+        assert_eq!(records[1].description, "[GroundCheck:confirmed] a.b");
+    }
 }

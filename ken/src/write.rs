@@ -24,6 +24,7 @@
 //! };
 //! ```
 
+use crate::calibration::Recalibrator;
 use crate::schema::{
     ChangeId, Claim, Element, Epistemics, FactValue, GeneratorHash, GroundBinding, Resolved,
     TriageSource, Volatility,
@@ -142,8 +143,16 @@ impl WriteOp {
 /// Confidence an ingest lands at, clamped to the triage ceiling. The data plane
 /// cannot exceed this no matter what confidence it requests.
 pub fn landed_confidence(triage: &TriageSource) -> f64 {
+    landed_confidence_with(triage, &Recalibrator::default())
+}
+
+/// [`landed_confidence`] with a fitted recalibration map (DESIGN §8) applied to
+/// LLM-triaged priors before the ceiling clamp. Grades the triage, never the
+/// ground truth: bare ingests and manual triage are not LLM claims, so the map
+/// does not touch them.
+pub fn landed_confidence_with(triage: &TriageSource, recalibrator: &Recalibrator) -> f64 {
     let requested = match triage {
-        TriageSource::Llm { meta_confidence } => *meta_confidence,
+        TriageSource::Llm { meta_confidence } => recalibrator.apply(*meta_confidence),
         TriageSource::Ingest => INGEST_DEFAULT_CONFIDENCE,
         TriageSource::Manual => INGEST_CONFIDENCE_CEILING,
     };
@@ -187,5 +196,45 @@ mod tests {
             meta_confidence: 0.1,
         });
         assert!((cool - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn recalibration_discounts_hot_llm_priors_on_ingest() {
+        use crate::calibration::{recalibrate, CalibrationSample};
+        // The triage claimed ~0.45 every time but held up only ~20% of the time.
+        let samples: Vec<CalibrationSample> = (0..100)
+            .map(|i| CalibrationSample {
+                prior: 0.45,
+                grounded_outcome: i % 10 < 2,
+            })
+            .collect();
+        let map = recalibrate(&samples);
+        let triage = TriageSource::Llm {
+            meta_confidence: 0.45,
+        };
+        let recalibrated = landed_confidence_with(&triage, &map);
+        let raw = landed_confidence(&triage);
+        assert!(
+            recalibrated < raw,
+            "fitted map should discount the hot prior: {recalibrated} vs {raw}"
+        );
+    }
+
+    #[test]
+    fn recalibration_leaves_non_llm_triage_alone() {
+        use crate::calibration::Recalibrator;
+        let fitted = Recalibrator { a: 0.2, b: -2.0 };
+        assert!(
+            (landed_confidence_with(&TriageSource::Ingest, &fitted)
+                - landed_confidence(&TriageSource::Ingest))
+            .abs()
+                < 1e-9
+        );
+        assert!(
+            (landed_confidence_with(&TriageSource::Manual, &fitted)
+                - landed_confidence(&TriageSource::Manual))
+            .abs()
+                < 1e-9
+        );
     }
 }
