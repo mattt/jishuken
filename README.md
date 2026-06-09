@@ -5,13 +5,17 @@ Self-verifying memory for agents.
 tracks how much it should still believe each one,
 and re-checks the ones that matter before they go stale enough to mislead anything.
 
-> **Status:** early.
-> The model is settled (see `DESIGN.md` and `THREAT-MODEL.md`);
-> the implementation is in progress.
-> Typed ground sources, locators, `ken ground`, and multi-ground conflicts are implemented,
-> except tree-sitter locators (`#ts:`), which parse but do not yet resolve;
+> **Status:** 0.1.0.
+> The model is settled (see `DESIGN.md` and `THREAT-MODEL.md`)
+> and the spine described in this README works:
+> the jj-backed store, the data/control-plane split,
+> typed ground sources and locators, multi-ground conflicts,
+> the scheduler, self-calibration, and the MCP data plane.
+> What is deferred is listed plainly under [Limitations](#limitations),
+> starting with tree-sitter locators (`#ts:`), which parse but do not yet resolve;
 > use a heading, quoted substring, or line-range locator in the meantime.
-> `ken` pins to a specific `jj` version until jj reaches 1.0.
+> `ken` pins to a supported `jj` version until jj reaches 1.0
+> and refuses to run against an older one.
 
 ## The problem
 
@@ -272,10 +276,10 @@ and an `Ungrounded` fact is a guess no matter how confident.
 
 | tool            | does                                                       |
 |-----------------|------------------------------------------------------------|
-| `ken_recall`    | value plus full epistemics (structured output, same shape as `--json`) |
-| `ken_ingest`    | add a fact; always lands `Ungrounded`; takes a `ground` hint; returns id |
-| `ken_search`    | find facts by entity, relation, or text; links each match to its fact resource |
-| `ken_conflicts` | list facts currently in conflict                           |
+| `ken_recall`    | value plus full epistemics (structured output, same shape as `--json`); takes an exact `entity.relation` key, and on a miss points to `ken_search` with the nearest keys |
+| `ken_ingest`    | add a fact; always lands `Ungrounded`; takes a `ground` hint; returns id. Re-ingesting a key supersedes its value and raises its re-verification priority |
+| `ken_search`    | find facts by entity, relation, or text; the text query is tokenized and ranked by tokens matched, so broad multi-word queries work; links each match to its fact resource |
+| `ken_conflicts` | list facts whose grounds disagree (`conflicts`), plus facts carrying a refuted ground not yet in full conflict (`distrusted`) |
 
 The read surface is also addressable as resources,
 so a fact can be fetched or attached as context without a tool call:
@@ -570,6 +574,29 @@ my-project/
 
 A fact carries its ground locators and the span hash each one last resolved to;
 the sources themselves stay where they live and `ken` only ever reads them.
+
+## Limitations
+
+What 0.1.0 defers, stated plainly so nothing reads as silently missing.
+
+- Tree-sitter locators (`#ts:`) parse but do not resolve.
+  A ground bound to one reads as `Errored` until 0.2.0.
+  Use a heading, quoted substring, or line-range locator in the meantime;
+  the line-range form is always paired with the span's content hash.
+- Networked locators are deferred:
+  `https://…#section` does not resolve yet.
+  Reach external sources through a `Command` (`curl` plus a predicate)
+  or a handler-backed mount instead.
+- Runtime dependencies are external.
+  `ken` shells out to `jj` (a supported version is enforced at startup),
+  to `deno` for generator and handler sources,
+  and to `git` for git-backed mounts.
+  None are bundled.
+- The launch agent is macOS only.
+  `ken serve --install-launch-agent` writes and loads a launchd agent;
+  on other platforms, run `ken serve` under your own service manager.
+- `branch_hypothesis` is a library surface without a CLI.
+  The jj primitive is wired but nothing user-facing drives it yet.
 
 ## Non-goals
 
