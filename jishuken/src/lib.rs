@@ -8,6 +8,7 @@ pub mod calibration;
 pub mod centrality;
 pub mod config;
 pub mod decay;
+pub mod duration;
 pub mod engine;
 pub mod error;
 pub mod ground;
