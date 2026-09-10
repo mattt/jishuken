@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain (with clippy + rustfmt) comes from rust-toolchain.toml.
+      - name: Install Rust
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Runtime dependency the e2e tests exercise: deno for generator/handler
+      # sources. Handler tests skip cleanly when it is absent.
+      - name: Install deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
