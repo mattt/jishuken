@@ -1,10 +1,9 @@
-//! Source generators: sandboxed code that *produces* a ground value (DESIGN
-//! §6a, repurposed). This is the reading layer's escape hatch for the
-//! authenticate-fetch-normalize case (the Makefile `curl | jq` target). The
-//! capability set lives inside the content hash, so a generator that starts
-//! asking for the network produces a loud diff and needs a fresh grant. The
-//! generator's stdout is the value; a pure predicate judges it later. No
-//! write-back to the store; hard timeout.
+//! Deno scripts that produce source text for a predicate to check.
+//!
+//! Generators read a claim from `KEN_VALUE` and write source text to stdout.
+//! Handlers resolve references for a configured source such as `kb:`.
+//! Their content hashes include declared capabilities.
+//! See the README's "Generators and handlers" and "Security" sections.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -127,9 +126,9 @@ impl GeneratorRegistry {
 
 /// Load a scheme handler from its on-disk module under the store root (e.g.
 /// `handlers/wiki.ts`) with the capabilities declared for its scheme, and
-/// return both the runnable source and its content-addressed reference. The
-/// hash covers source AND capabilities, so any drift in either is a loud diff
-/// (DESIGN §6a).
+/// return both the runnable source and its content-addressed reference.
+/// The hash covers source AND capabilities, so any drift in either is a loud
+/// diff.
 ///
 /// # Errors
 /// Returns an error if the handler module cannot be read.
@@ -199,6 +198,7 @@ impl Sandbox {
 
     /// Run a generator with `KEN_VALUE` set to the claim. Its stdout is the
     /// produced ground value.
+    /// A mismatched source or capability hash returns without starting the runtime.
     pub fn run(
         &self,
         src: &GeneratorSrc,
@@ -207,6 +207,9 @@ impl Sandbox {
     ) -> GeneratorRun {
         let current = src.hash();
         let hash_changed = recorded_hash.is_some_and(|h| *h != current);
+        if hash_changed {
+            return errored(true);
+        }
 
         let dir = std::env::temp_dir();
         let stem = unique_stem(&current.0[..16]);
@@ -227,6 +230,7 @@ impl Sandbox {
     /// the CURIE's path and `env` is the declared `env` capabilities resolved
     /// from the host. The handler's returned string is its stdout (the document
     /// bytes); a throw is a nonzero exit (`Errored`); a timeout is `Transient`.
+    /// A mismatched source or capability hash returns without starting the runtime.
     pub fn run_handler(
         &self,
         src: &GeneratorSrc,
@@ -236,6 +240,9 @@ impl Sandbox {
     ) -> GeneratorRun {
         let current = src.hash();
         let hash_changed = recorded_hash.is_some_and(|h| *h != current);
+        if hash_changed {
+            return errored(true);
+        }
 
         let stem = unique_stem(&current.0[..16]);
         let dir = std::env::temp_dir();
@@ -286,7 +293,7 @@ impl Sandbox {
     }
 
     /// Build a `deno run` command with the standard sandbox flags and the
-    /// capability allowlists folded into the content hash (DESIGN §6a).
+    /// capability allowlists folded into the content hash.
     fn deno_run(&self, caps: &Capabilities, env_flag: String) -> Command {
         let mut cmd = Command::new(&self.runtime);
         cmd.arg("run")
@@ -464,6 +471,55 @@ mod tests {
         );
         assert_eq!(with_env.scheme, "wiki");
         assert_eq!(with_env.src_path, "handlers/wiki.ts");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_mismatch_never_starts_the_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = dir.path().join("runtime");
+        let marker = dir.path().join("runtime.started");
+        std::fs::write(&runtime, "#!/bin/sh\n: > \"$0.started\"\nprintf trusted\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sb = Sandbox::new(runtime.to_str().unwrap(), Duration::from_secs(10));
+        let original = GeneratorSrc::new("reader.ts", "trusted source", Capabilities::default());
+        let recorded = original.hash();
+        let mut changed_source = original.clone();
+        changed_source.source = "changed source".into();
+        let mut changed_caps = original.clone();
+        changed_caps.caps.env.push("TOKEN".into());
+
+        for src in [&changed_source, &changed_caps] {
+            for run in [
+                sb.run(src, Some(&recorded), "claim"),
+                sb.run_handler(src, Some(&recorded), "reference", None),
+            ] {
+                assert!(run.hash_changed);
+                assert!(
+                    !run.spawned,
+                    "a changed hash must prevent execution: {run:?}"
+                );
+                assert!(!run.ok());
+                assert_eq!(run.exit_code, None);
+                assert!(run.stdout.is_empty());
+                assert!(
+                    !marker.exists(),
+                    "the runtime must not run on a hash mismatch"
+                );
+            }
+        }
+
+        // Prove the runtime probe works and matching hashes can still execute.
+        for run in [
+            sb.run(&original, Some(&recorded), "claim"),
+            sb.run_handler(&original, Some(&recorded), "reference", None),
+        ] {
+            assert!(run.ok(), "a matching hash should execute: {run:?}");
+            assert_eq!(run.stdout, "trusted");
+        }
+        assert!(marker.exists());
     }
 
     #[test]

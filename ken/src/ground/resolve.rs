@@ -33,10 +33,10 @@ pub enum ReadResult {
     Errored(String),
 }
 
-/// Build a ground source from a parsed source reference. A named root that is
-/// handler-backed in config (a CURIE scheme with `[sources.<scheme>] handler`)
-/// mounts code, capturing the handler's content hash now (DESIGN §6a); any
-/// other root is a plain file read.
+/// Build a ground source from a parsed source reference.
+/// A named root that is handler-backed in config (a CURIE scheme with
+/// `[sources.<scheme>] handler`) mounts code, capturing the handler's content
+/// hash now; any other root is a plain file read.
 ///
 /// # Errors
 /// Returns an error if a handler-backed scheme's module cannot be loaded.
@@ -139,13 +139,12 @@ fn read_source(
                 config.sandbox.runtime.clone(),
                 Duration::from_secs_f64(config.sandbox.timeout_secs()),
             );
-            if !sandbox.available() {
-                return Err(ReadFail::Errored(format!(
-                    "sandbox runtime `{}` not available",
-                    config.sandbox.runtime
-                )));
-            }
             let run = sandbox.run(&src, Some(&gref.hash), claim);
+            if run.hash_changed {
+                return Err(ReadFail::Errored(
+                    "generator source or capabilities changed; update its binding".into(),
+                ));
+            }
             if run.timed_out {
                 return Err(ReadFail::Transient);
             }
@@ -157,7 +156,7 @@ fn read_source(
         GroundSource::Handler(h) => {
             let scheme = &h.handler.scheme;
             // Rebuild from the *current* config caps and live source, so drift
-            // in either is a loud diff against the recorded hash (DESIGN §6a).
+            // in either is a loud diff against the recorded hash.
             let (src_path, caps) = config.handler_for(scheme).ok_or_else(|| {
                 ReadFail::Errored(format!(
                     "source root `{scheme}` is no longer handler-backed"
@@ -169,14 +168,13 @@ fn read_source(
                 config.sandbox.runtime.clone(),
                 Duration::from_secs_f64(config.sandbox.timeout_secs()),
             );
-            if !sandbox.available() {
-                return Err(ReadFail::Errored(format!(
-                    "sandbox runtime `{}` not available",
-                    config.sandbox.runtime
-                )));
-            }
             let run =
                 sandbox.run_handler(&src, Some(&h.handler.hash), &h.reference, h.rev.as_deref());
+            if run.hash_changed {
+                return Err(ReadFail::Errored(format!(
+                    "handler `{scheme}` source or capabilities changed; update its binding"
+                )));
+            }
             if run.timed_out {
                 return Err(ReadFail::Transient);
             }
