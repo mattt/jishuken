@@ -1,9 +1,11 @@
 # Jishuken
 
 Self-verifying memory for agents.
-`ken` keeps a store of facts,
-tracks how much it should still believe each one,
-and re-checks the ones that matter before they go stale enough to mislead anything.
+`ken` holds what an agent learned about the systems and people it cannot re-read at decision time,
+and tells it how much to still believe each thing.
+Facts with a checkable source are re-verified on a budget before they go stale enough to mislead anything;
+facts without one decay at a rate set by how fast that kind of thing changes,
+so the agent knows when to hedge or ask.
 
 > **Status:** 0.1.0.
 > The model is settled (see `DESIGN.md` and `THREAT-MODEL.md`)
@@ -20,13 +22,16 @@ and re-checks the ones that matter before they go stale enough to mislead anythi
 ## The problem
 
 An agent's memory fills up with facts,
-and the facts quietly rot.
-The wiki still says auth lives in `src/middleware/auth.ts`,
-but the code moved it two refactors ago.
-A runbook describes a release process one reorg out of date,
-a staging URL moves,
-a dependency bumps a major version,
-and the agent keeps acting on what was true last quarter.
+and the facts rot.
+The release owner changed at the last reorg,
+the on-call rotation moved to a new tool,
+the staging URL moved,
+a partner bumped their API to v3,
+the runbook in the platform team's wiki describes the old deploy,
+and the contact who joined Acme three years ago may not be there now.
+None of that is in the tree the agent is working in,
+so nothing prompts it to look,
+and it keeps acting on what was true last quarter.
 Keeping all of it current has no upper bound on effort,
 so the only sane policy is to spend verification where being wrong is expensive and let the rest decay.
 
@@ -35,6 +40,37 @@ It keeps what it *believes* separate from what it has actually *checked*,
 so a confident guess never gets mistaken for a confirmed fact.
 And it schedules its own re-verification by expected value,
 so the budget goes to the facts most likely to be both wrong and consequential.
+
+## When to use ken
+
+A fact belongs in `ken` when both of these hold:
+
+- Being wrong about it costs something.
+- The agent cannot cheaply re-derive it at the moment it acts,
+  because the source is in another system, another repo, a live service, or a person.
+
+If the answer is one `grep` or file read away, do not store it.
+The agent will re-check it anyway,
+and `ken` adds nothing but a second copy that can rot.
+
+If the fact has a source `ken` can read, bind a ground and it is re-verified on a budget.
+A fact with no readable source still earns its keep:
+`ken` tracks how stale it is,
+and the volatility class says how long that kind of fact usually stays true
+(the half-life of each class is set in `ken.toml`).
+"Joe joined Acme" decays over a few years, because people change jobs;
+"M and D got married" barely moves over a decade.
+An agent that reads a medium confidence knows to hedge or ask,
+and one that reads a high confidence can proceed.
+Often a passive ground exists after all:
+the last email from `joe@acme.com` confirms "Joe at Acme" as of that date,
+and a `Command` source over a mailbox can read it.
+
+`ken` is not a retrieval index.
+It tracks a bounded set of facts it can reason about,
+not a corpus it searches over.
+Point a RAG system at your documents;
+point `ken` at the handful of facts whose staleness would actually cost you something.
 
 ## Model
 
@@ -75,7 +111,7 @@ so a confidently-wrong belief cannot sit undisturbed forever.
 
 A ground source is more than a file path.
 It is a typed reference to where the truth lives and a *locator* that points at the span within it,
-so a fact records not "checked against `Architecture.md`" but "checked against its `## Authentication` section, at wiki revision `9f12`, whose span hashed to `b7c4`."
+so a fact records not "checked against `Release.md`" but "checked against its `## Owner` section, at wiki revision `9f12`, whose span hashed to `b7c4`."
 Pin the revision and you can prove later what the verifier actually saw.
 Hash the span and a replay against a since-changed source no longer passes for a fresh confirmation.
 
@@ -156,17 +192,20 @@ but naming a source is not grounding against it,
 so the fact stays `Ungrounded` until a ground check on the control plane confirms it.
 
 ```sh
-ken add auth.handler "src/auth/verify_token.rs" \
+ken add release.owner "priya" \
     --volatility days \
-    --ground 'src/auth/verify_token.rs#ts:(function_item name:(identifier) @n (#eq? @n "verify_token"))'
+    --ground 'wiki:Release.md#owner'
 ```
+
+The runbook lives in the platform team's repo, mounted as `wiki:` (see [Schemes](#schemes)),
+so the agent cannot re-read it by grepping its own tree.
 
 Set-valued facts are stored whole and verified in one pass,
 with each element tracked on its own so confirming the list does not smear credit over the one entry you were unsure about:
 
 ```sh
-ken add api.public_routes --json routes.json --volatility days \
-    --ground 'src/router.rs#ts:(call function:(_) @f (#match? @f "route"))'
+ken add oncall.roster --json roster.json --volatility days \
+    --ground 'wiki:Oncall.md#rotation'
 ```
 
 Recall a fact.
@@ -174,24 +213,23 @@ The human form is a small report;
 agents pass `--json`.
 
 ```sh
-ken recall auth.handler
+ken recall release.owner
 ```
 
 ```
-auth.handler = src/auth/verify_token.rs
+release.owner = priya
   confidence   0.71   volatility=days
-  grounded     verified 6h ago · ts-match.ts@a1b2c3
+  grounded     verified 6h ago · wiki:Release.md#owner @ git 9f12
   due          in 2d
 ```
 
 ```json
 {
-  "key": "auth.handler",
-  "value": "src/auth/verify_token.rs",
+  "key": "release.owner",
+  "value": "priya",
   "confidence": 0.71,
   "groundedness": { "state": "verified", "at": "2026-06-06T09:14:00Z",
-                    "verifier": "ts-match.ts@a1b2c3",
-                    "source": "src/auth/verify_token.rs#ts:verify_token @ jj kxnq" },
+                    "source": "wiki:Release.md#owner @ git 9f12" },
   "last_verified": "2026-06-06T09:14:00Z",
   "due": "2026-06-08T09:14:00Z"
 }
@@ -204,8 +242,8 @@ which is the one thing this store exists to tell it.
 ### Inspection
 
 ```sh
-ken why auth.handler    # provenance back to the ground sources, with op IDs
-ken search auth         # find facts by entity, relation, text, or groundedness
+ken why release.owner   # provenance back to the ground sources, with op IDs
+ken search release      # find facts by entity, relation, text, or groundedness
 ken stale --limit 10    # what is due, ranked by value of information
 ken conflicts           # facts currently holding two answers
 ken log                 # the operation log (this is jj op log underneath)
@@ -213,33 +251,34 @@ ken undo                # roll the store back one operation
 ```
 
 `ken why` answers the question a stored fact can never answer about itself.
-Bind a second, independent ground source to `auth.handler` (the wiki, below) and the picture sharpens:
+Bind a second, independent ground source to `release.owner` (the live release service, below) and the picture sharpens:
 each source shows by name, and a disagreement between them becomes visible rather than silently averaged away.
 
 ```
-auth.handler = src/auth/verify_token.rs
+release.owner = priya
   ingested   2026-05-02 by mcp/agent:nightly      (confidence 0.40, ungrounded)
-  verified   2026-05-02 ts-match.ts@a1b2c3     -> confirmed  (op 7f3a)
-  verified   2026-06-06 ts-match.ts@a1b2c3     -> confirmed  (op c19d)
-  ground     FILE  src/auth/verify_token.rs  ts:verify_token  @ jj kxnq   (net: none)
-  verified   2026-06-06 wiki-section.ts@d4e5f6 -> refuted    (op e8a0)
-  ground     WIKI  Architecture.md#authentication           @ git 9f12   (net: none)
-  conflict   code says src/auth/verify_token.rs · wiki says src/middleware/auth.ts
+  checked    2026-05-02 wiki:Release.md#owner    -> confirmed  (op 7f3a)
+  checked    2026-06-06 wiki:Release.md#owner    -> confirmed  (op c19d)
+  ground     WIKI  Release.md#owner  [contains]  @ git 9f12          (net: none)
+  checked    2026-06-06 curl api.internal/release -> refuted    (op e8a0)
+  ground     CMD   curl -s https://api.internal/release  [ptr:/owner:equals]  (net: api.internal)
+  conflict   runbook says priya · service says sam
 ```
 
-That last line is the source-and-wiki drift made into data.
-The code ground and the wiki ground are independent verifiers against independent repositories,
+That last line is the runbook-and-service drift made into data.
+The runbook ground and the live ground are independent readers of independent systems,
 so when they disagree the fact does not silently pick a winner;
-it holds both answers as a jj conflict and surfaces in `ken conflicts` until something resolves it.
-The disagreement is the signal: the docs are stale, and now you know which way.
+it holds both answers and surfaces in `ken conflicts` until something resolves it.
+The disagreement is the signal: the runbook is stale, and now you know which way.
 
 ### Control plane
 
 ```sh
-ken ground auth.handler \
-    --source wiki:Architecture.md#authentication --rev main   # bind an independent ground source
-ken verify auth.handler                                       # force a ground check now
-ken doubt  auth.handler --reason "..."                        # manual override of belief, logged
+ken ground release.owner \
+    --command 'curl -s https://api.internal/release' \
+    --predicate 'ptr:/owner:equals'                           # bind an independent, live ground source
+ken verify release.owner                                      # force a ground check now
+ken doubt  release.owner --reason "..."                       # manual override of belief, logged
 ken grant  verifiers/notion-roster.ts --net api.notion.com    # entitle a networked verifier
 ```
 
@@ -356,7 +395,7 @@ Dropping to a more powerful kind costs you determinism, trust, and cadence, so d
 So "fetch JSON, check a key" needs no code: a `curl` command plus a JSON-pointer predicate.
 
 ```sh
-ken ground api.owner \
+ken ground release.owner \
     --command 'curl -s https://api.internal/release' \
     --predicate 'ptr:/owner:equals'
 ```
@@ -378,7 +417,7 @@ which makes "files only" your offline mode and your containment mode at once.
 
 A named source root is a mount.
 `[sources.wiki]` binds the `wiki:` prefix to a place ken reads bytes from,
-addressed by a CURIE (a compact URI): a `scheme:reference` prefix, here `wiki:Architecture`.
+addressed by a CURIE (a compact URI): a `scheme:reference` prefix, here `wiki:Release`.
 A repo-backed mount points at a separate repository (`repo = "../wiki"`), read through its own VCS.
 A handler-backed mount points at sandboxed code (`handler = "handlers/wiki.ts"`),
 a reusable reader for sources that have to authenticate, page, or normalize.
@@ -395,13 +434,13 @@ export default {
       headers: { authorization: `Bearer ${env.WIKI_TOKEN}` },
     });
     if (!res.ok) throw new Error(`wiki ${reference}: ${res.status}`);
-    return await res.text();   // ken slices the #authentication section, then judges it
+    return await res.text();   // ken slices the #owner section, then judges it
   },
 };
 ```
 
-So `ken ground auth.handler --source wiki:Architecture#authentication` reads the wiki through the handler
-and judges the `#authentication` section, the same locator it would use on a local file.
+So `ken ground release.owner --source wiki:Release#owner` reads the wiki through the handler
+and judges the `#owner` section, the same locator it would use on a local file.
 The symmetry is the addressing and the mount table; the difference is the channel.
 A repo mount is a deterministic file read and counts full.
 A handler mount is code, so it counts at the generator's tier:
@@ -603,12 +642,6 @@ What 0.1.0 defers, stated plainly so nothing reads as silently missing.
 `ken` is not a general knowledge graph or a query endpoint.
 It normalizes the keys it has to traverse (entities and dependency edges) and leaves everything else as loose payload,
 so do not expect SPARQL.
-
-It is not a retrieval index.
-`ken` tracks a bounded set of facts it can verify,
-not a corpus it searches over.
-Point a RAG system at your documents;
-point `ken` at the handful of facts whose staleness would actually cost you something.
 
 It is not a test runner.
 A check over fixed inputs that should always pass is a test, and belongs in your CI.
