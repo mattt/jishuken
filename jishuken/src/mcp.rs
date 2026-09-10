@@ -87,6 +87,7 @@ pub struct IngestParams {
     key: String,
     value: String,
     /// Confidence half-life: ISO 8601 (P14D), shorthand (14d, 1h30m), or never.
+    /// Shorthand cannot contain whitespace.
     /// Defaults to `decay.default_half_life` in `ken.toml` (3 days).
     half_life: Option<String>,
     meta_confidence: Option<f64>,
@@ -866,7 +867,7 @@ mod tests {
         for (input, expected) in [
             (None, "P14D"),
             (Some("pt1h30m"), "PT1H30M"),
-            (Some("1 hour, 30 minutes"), "PT1H30M"),
+            (Some("1h30m"), "PT1H30M"),
             (Some("P1M"), "P1M"),
             (Some("never"), "never"),
             (Some("1ns"), "PT0.000000001S"),
@@ -885,7 +886,21 @@ mod tests {
             assert_eq!(recalled.due.is_none(), expected == "never");
         }
         let before = std::fs::read(dir.path().join("ops.jsonl")).unwrap();
-        for input in ["nonsense", "PT0S", "-P1D", "NaN", "", "PT1.5H1M"] {
+        for input in [
+            "nonsense",
+            "PT0S",
+            "-P1D",
+            "NaN",
+            "",
+            "PT1.5H1M",
+            "1 hour, 30 minutes",
+            "1h 30m",
+            "1h\t30m",
+            "1h\n30m",
+            "1h\u{00a0}30m",
+            " 1h",
+            "1h ",
+        ] {
             let mut params = ingest_params("test.duration", "must not replace");
             params.half_life = Some(input.into());
             assert!(server

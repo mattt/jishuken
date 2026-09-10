@@ -740,7 +740,6 @@ fn cli_half_lives_use_durations_and_save_the_ingest_default() {
         ("P1M", "P1M"),
         ("PT1M", "PT1M"),
         ("1h30m", "PT1H30M"),
-        ("1 hour, 30 minutes", "PT1H30M"),
         ("never", "never"),
         ("1ns", "PT0.000000001S"),
     ] {
@@ -761,7 +760,21 @@ fn cli_half_lives_use_durations_and_save_the_ingest_default() {
         assert_eq!(recalled["due"], serde_json::to_value(expected_due).unwrap());
     }
     let before = std::fs::read(store.root().join("ops.jsonl")).unwrap();
-    for input in ["PT0S", "NaN", "typo", "-P1D", "P1DT", "PT1.5H1M"] {
+    for input in [
+        "PT0S",
+        "NaN",
+        "typo",
+        "-P1D",
+        "P1DT",
+        "PT1.5H1M",
+        "1 hour, 30 minutes",
+        "1h 30m",
+        "1h\t30m",
+        "1h\n30m",
+        "1h\u{00a0}30m",
+        " 1h",
+        "1h ",
+    ] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
             .args([
                 "--store",

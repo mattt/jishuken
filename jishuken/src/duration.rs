@@ -21,7 +21,8 @@ const DAY: u128 = 24 * HOUR;
 const WEEK: u128 = 7 * DAY;
 
 /// A positive duration, precise to one nanosecond.
-/// Parse ISO 8601 (`P1DT2H`, `PT0.5S`) or shorthand (`1d 2h`, `500ms`).
+/// Parse ISO 8601 (`P1DT2H`, `PT0.5S`) or shorthand (`1d2h`, `500ms`).
+/// Shorthand cannot contain whitespace, including leading or trailing whitespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Duration {
     months: u32,
@@ -34,7 +35,7 @@ pub struct Duration {
 pub struct ParseDurationError(&'static str);
 
 const SYNTAX: ParseDurationError =
-    ParseDurationError("expected an ISO 8601 duration (PT1H30M) or a duration with units (1h 30m)");
+    ParseDurationError("expected an ISO 8601 duration (PT1H30M) or a duration with units (1h30m)");
 const RANGE: ParseDurationError = ParseDurationError("duration is too large");
 const POSITIVE: ParseDurationError = ParseDurationError("duration must be greater than zero");
 const PRECISION: ParseDurationError =
@@ -50,7 +51,7 @@ static ISO: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static HUMAN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^([0-9]+(?:[.,][0-9]+)?|[.,][0-9]+)\s*([a-zµμ]+)")
+    Regex::new(r"(?i)^([0-9]+(?:[.,][0-9]+)?|[.,][0-9]+)([a-zµμ]+)")
         .expect("valid shorthand duration pattern")
 });
 
@@ -178,9 +179,9 @@ impl Duration {
                     "ns" | "nanosecond" | "nanoseconds" => parts.fixed(number, 1)?,
                     _ => return Err(SYNTAX),
                 }
-                input = input[captures[0].len()..].trim_start();
+                input = &input[captures[0].len()..];
                 if let Some(rest) = input.strip_prefix(',') {
-                    input = rest.trim_start();
+                    input = rest;
                     if input.is_empty() {
                         return Err(SYNTAX);
                     }
@@ -239,15 +240,22 @@ impl FromStr for Duration {
     type Err = ParseDurationError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let input = input.trim();
-        let input = input.strip_prefix('+').unwrap_or(input).trim_start();
-        if input.starts_with(['-', '−']) {
+        let normalized = input.trim();
+        let normalized = normalized
+            .strip_prefix('+')
+            .unwrap_or(normalized)
+            .trim_start();
+        if normalized.starts_with(['-', '−']) {
             return Err(POSITIVE);
         }
-        if input.starts_with(['P', 'p']) {
-            Self::iso(input)
+        if normalized.starts_with(['P', 'p']) {
+            Self::iso(normalized)
+        } else if input.contains(char::is_whitespace) {
+            Err(ParseDurationError(
+                "shorthand durations cannot contain whitespace",
+            ))
         } else {
-            Self::human(input)
+            Self::human(normalized)
         }
     }
 }

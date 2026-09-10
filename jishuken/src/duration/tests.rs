@@ -62,27 +62,24 @@ fn shorthand_units_and_compounds() {
         ("90d", "P90D"),
         ("1h30m", "PT1H30M"),
         ("1h,30m", "PT1H30M"),
-        ("1 hour, 30 minutes", "PT1H30M"),
-        ("1 hour 30 minutes", "PT1H30M"),
-        ("1 YEAR 2 months 3 weeks 4 days", "P1Y2M25D"),
-        ("1yr 2mos 3wks 4d 5hrs 6mins 7secs", "P1Y2M25DT5H6M7S"),
-        ("1y 1mo", "P1Y1M"),
+        ("1hour,30minutes", "PT1H30M"),
+        ("1hour30minutes", "PT1H30M"),
+        ("1YEAR2months3weeks4days", "P1Y2M25D"),
+        ("1yr2mos3wks4d5hrs6mins7secs", "P1Y2M25DT5H6M7S"),
+        ("1y1mo", "P1Y1M"),
         ("1m", "PT1M"),
         ("1.5d", "P1DT12H"),
         (".5w", "P3DT12H"),
-        ("+ 2 h", "PT2H"),
-        ("  +2 h \t30 min  ", "PT2H30M"),
-        ("1,5 seconds", "PT1.5S"),
+        ("+2h", "PT2H"),
+        ("+2h30min", "PT2H30M"),
+        ("1,5seconds", "PT1.5S"),
         ("1ms", "PT0.001S"),
-        ("1 microsecond", "PT0.000001S"),
-        ("1us 2µs 3μs", "PT0.000006S"),
+        ("1microsecond", "PT0.000001S"),
+        ("1us2µs3μs", "PT0.000006S"),
         ("1ns", "PT0.000000001S"),
         ("0.1ms", "PT0.0001S"),
-        ("1 nanosecond", "PT0.000000001S"),
-        (
-            "1 millisecond 2 microseconds 3 nanoseconds",
-            "PT0.001002003S",
-        ),
+        ("1nanosecond", "PT0.000000001S"),
+        ("1millisecond2microseconds3nanoseconds", "PT0.001002003S"),
         ("60", "PT1M"),
         ("0.5", "PT0.5S"),
     ] {
@@ -91,6 +88,48 @@ fn shorthand_units_and_compounds() {
             iso.parse::<Duration>().unwrap(),
             "{input}"
         );
+    }
+}
+
+#[test]
+fn rejects_all_unicode_whitespace_anywhere_in_shorthand() {
+    let whitespace = [
+        '\t', '\n', '\r', '\u{000B}', '\u{000C}', ' ', '\u{0085}', '\u{00A0}', '\u{1680}',
+        '\u{2000}', '\u{2001}', '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}',
+        '\u{2007}', '\u{2008}', '\u{2009}', '\u{200A}', '\u{2028}', '\u{2029}', '\u{202F}',
+        '\u{205F}', '\u{3000}',
+    ];
+    for space in whitespace {
+        for input in [
+            format!("{space}1h"),
+            format!("1h{space}"),
+            format!("1{space}h"),
+            format!("1h{space}30m"),
+            format!("1h,{space}30m"),
+            format!("+{space}1h"),
+            format!("60{space}"),
+            format!("1{space}hour"),
+        ] {
+            assert!(input.parse::<Duration>().is_err(), "accepted {input:?}");
+            assert!(input.parse::<HalfLife>().is_err(), "accepted {input:?}");
+            assert!(
+                input.parse::<FixedDuration>().is_err(),
+                "accepted {input:?}"
+            );
+            let json = serde_json::to_string(&input).unwrap();
+            assert!(
+                serde_json::from_str::<Duration>(&json).is_err(),
+                "accepted {input:?}"
+            );
+            assert!(
+                serde_json::from_str::<HalfLife>(&json).is_err(),
+                "accepted {input:?}"
+            );
+            assert!(
+                serde_json::from_str::<FixedDuration>(&json).is_err(),
+                "accepted {input:?}"
+            );
+        }
     }
 }
 

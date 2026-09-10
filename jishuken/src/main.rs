@@ -140,6 +140,7 @@ struct AddArgs {
     #[arg(long)]
     json: Option<PathBuf>,
     /// Confidence half-life: ISO 8601, shorthand (14d, 1h30m), or never.
+    /// Shorthand cannot contain whitespace.
     /// Defaults to `decay.default_half_life` in `ken.toml` (3 days).
     #[arg(long)]
     half_life: Option<HalfLife>,

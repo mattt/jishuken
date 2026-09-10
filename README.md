@@ -275,7 +275,7 @@ Confidence tends toward `0.5` as a fact ages.
 Set its half-life with `--half-life P3D` (three days).
 After one half-life, confidence of `0.9` becomes `0.7`.
 Durations accept ISO 8601 (`PT15M`, `P2W`, `P1Y`)
-and shorthand (`15m`, `2w`, `1h30m`, `1 hour 30 minutes`).
+and shorthand without whitespace (`15m`, `2w`, `1h30m`).
 Lowercase, a leading `+`, and decimal fractions such as `PT1.5H` are accepted.
 `P1M` means one calendar month; `PT1M` and `1m` mean one minute.
 Months and years count from the last verification date in UTC,

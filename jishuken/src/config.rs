@@ -327,13 +327,34 @@ default_caps = []
     }
 
     #[test]
+    fn config_rejects_whitespace_in_shorthand() {
+        for input in ["1h 30m", "1 hour", "1h\t30m", " 1h", "1h ", "1h\u{00a0}30m"] {
+            for (table, field) in [
+                ("decay", "default_half_life"),
+                ("daemon", "interval"),
+                ("sandbox", "timeout"),
+            ] {
+                let value = toml::Value::String(input.into());
+                let mut config = format!("[{table}]\n{field} = {value}\n");
+                if table == "sandbox" {
+                    config.push_str("runtime = \"deno\"\n");
+                }
+                assert!(
+                    toml::from_str::<Config>(&config).is_err(),
+                    "accepted {config:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn duration_forms_roundtrip_through_config() {
         let cfg: Config = toml::from_str(
             r#"
 [decay]
 default_half_life = "P1M"
 [daemon]
-interval = "1 minute, 30 seconds"
+interval = "1m30s"
 [sandbox]
 runtime = "deno"
 timeout = "PT0.5S"
