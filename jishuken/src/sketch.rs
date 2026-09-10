@@ -15,8 +15,7 @@ struct Centroid {
     weight: f64,
 }
 
-/// A streaming quantile sketch over a stream of `f64` samples. Bounded in size
-/// by [`COMPRESSION`], so it stays small no matter how many samples it sees.
+/// A bounded sketch for estimating quantiles from a stream of `f64` samples.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TDigest {
     centroids: Vec<Centroid>,

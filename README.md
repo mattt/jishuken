@@ -16,6 +16,8 @@ Keep the store small enough that its contents are worth checking.
 
 ## Installation
 
+The Cargo package and Rust library are named `jishuken`; the command is `ken`.
+
 Build and install from a checkout:
 
 ```sh
@@ -24,7 +26,8 @@ cd jishuken
 cargo install --path jishuken
 ```
 
-The repository pins its Rust toolchain in `rust-toolchain.toml`.
+Building requires Rust 1.90 or later;
+the repository pins its toolchain in `rust-toolchain.toml`.
 Ordinary file sources need no other runtime.
 Scripts require Deno; reading a pinned repository revision requires Git or jj.
 
@@ -34,17 +37,20 @@ In the project where your agent works, create a store and remember a fact:
 
 ```sh
 ken init
-ken add release.owner priya --volatility days
+ken add release.owner ryu --volatility days
 ken recall release.owner
 ```
 
-The key is `entity.relation`; the value here is `priya`.
+The key is `entity.relation`; the value here is `ryu`.
+Keys are case-sensitive and use [Unicode NFC normalization](https://www.unicode.org/reports/tr31/#Normalization_and_Case),
+so composed and decomposed spellings of `é` identify the same fact.
+
 New facts are `ungrounded`.
 Their initial confidence is capped,
 and a caller cannot supply a verified status.
 
 Suppose a neighboring `wiki` checkout contains `Release.md`,
-with an `## Owner` section naming `priya`.
+with an `## Owner` section naming `ryu`.
 Add a source to `.ken/ken.toml`:
 
 ```toml
@@ -85,10 +91,11 @@ Verification does not replace a scalar value with a new answer.
 
 To correct a fact, add it again under the same key.
 This replaces the value and its ground bindings and resets it to `ungrounded`.
-An optional `--ground` hint supplies a source for the scheduler to check later,
-using the `exists` predicate.
-That checks whether the source resolves to nonempty text;
-use an explicit predicate as above to check what it says.
+An optional `--ground` hint records a suggested source.
+It remains separate from active grounds and is never scheduled.
+Use `ken ground` with an explicit predicate before verification can begin.
+Hints from earlier stores are identified through the op log;
+their existence checks no longer count as evidence, and affected facts need rechecking.
 
 For structured values, pass `--json values.json` instead of a scalar.
 A JSON array becomes one set-valued fact, checked as a unit,
@@ -168,7 +175,7 @@ and configured names such as `wiki:` select another source root.
 | --- | --- |
 | `Release.md` | The whole file |
 | `Release.md#owner` | A Markdown section |
-| `Release.md?q="priya"` | A quoted substring |
+| `Release.md?q="ryu"` | A quoted substring |
 | `Release.md#L40-58` | A line range |
 
 A heading survives edits elsewhere in a document
@@ -187,7 +194,7 @@ Use a command or a handler to fetch remote content.
 
 | Predicate | Test |
 | --- | --- |
-| `exists` | The locator resolves to nonempty text. This is the default. |
+| `exists` | The locator resolves to nonempty text. |
 | `equals[:literal]` | The span equals the claim, or the given literal. |
 | `contains[:literal]` | The span contains the claim, or the given literal. |
 | `matches:<regex>` | The span matches a regular expression. |
@@ -213,7 +220,7 @@ ken ground release.owner \
 ```
 
 This adds a second ground to the runbook example.
-If the API says `sam` while the runbook still says `priya`,
+If the API says `zangief` while the runbook still says `ryu`,
 the fact becomes conflicted.
 `ken why release.owner` shows which check disagreed.
 
@@ -375,6 +382,12 @@ Fact files hold the current state.
 Every `WriteOp` produces one tagged record in `ops.jsonl`,
 including the before and after bytes of affected files.
 Writes use a store lock; operate the store with a single writer.
+Changes are staged, then committed with a rollback journal and atomic file replacement.
+An interrupted operation is rolled back when the store next opens.
+Fact filenames escape punctuation, Unicode, and uppercase letters
+to keep distinct keys separate on case-insensitive filesystems.
+Existing filenames migrate on the next write.
+If existing files have canonically equivalent keys, ken reports the duplicate for resolution.
 `undo` restores the last record's saved bytes and removes that record.
 It is the operation that rewrites history.
 
@@ -400,11 +413,9 @@ An agent with shell access to `ken verify`, the library's control APIs,
 or write access to `.ken/` can cross that boundary.
 Restrict those permissions when relying on it.
 
-Source hints also affect what a later scheduler run reads.
-File reads use the host filesystem without a sandbox,
-and an MCP client can name a file source.
-Only accept hints from callers you trust to select files
-that the verifier account may read.
+An MCP client can suggest a file source, but hints do not authorize reads.
+Review the source and predicate before binding them with `ken ground`.
+File reads use the host filesystem without a sandbox.
 Ingest can overwrite an existing key and its grounds;
 it has no separate challenge queue protecting the old value.
 

@@ -5,6 +5,7 @@ members = ["jishuken"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.90"
 license = "MIT"
 repository = "https://github.com/mattt/jishuken"
 
@@ -20,6 +21,7 @@ toml = "0.8"
 regex = "1"
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt", "io-std", "time"] }
+unicode-normalization = "0.1.25"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -35,6 +35,7 @@ pub(crate) fn verified_scalar(key: &str) -> Fact {
             priority: 0.0,
         },
         grounds: vec![],
+        source_hint: None,
         provenance: Provenance {
             ingested_by: "test".into(),
             ingested_at: now,

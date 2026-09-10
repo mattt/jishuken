@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use unicode_normalization::UnicodeNormalization;
 
 use jishuken::calibration::{brier_score, recalibrate, reliability_bins};
 use jishuken::decay::{decayed_confidence, half_life_secs};
@@ -175,7 +176,7 @@ struct GroundArgs {
     #[arg(long)]
     source: Option<String>,
     /// Command source, e.g. `curl -s https://api.internal/release`
-    /// (argv[0] must be in the `[command] allow` list).
+    /// (`argv[0]` must be in the `[command] allow` list).
     #[arg(long)]
     command: Option<String>,
     /// Generator source: a sandboxed Deno script that emits the value.
@@ -184,9 +185,9 @@ struct GroundArgs {
     /// Pin the source revision (File sources).
     #[arg(long)]
     rev: Option<String>,
-    /// How to judge the span: exists | equals[:lit] | contains[:lit] |
-    /// matches:<re> | num:<op>:<n> | ptr:<rfc6901>[:<sub>].
-    #[arg(long, default_value = "exists")]
+    /// How to judge the span: `exists` | `equals[:lit]` | `contains[:lit]` |
+    /// `matches:<re>` | `num:<op>:<n>` | `ptr:<rfc6901>[:<sub>]`.
+    #[arg(long)]
     predicate: String,
 }
 
@@ -352,8 +353,7 @@ fn cmd_add(
         None => TriageSource::Ingest,
     };
 
-    // `--ground` is a hint: a draft File binding with the default `Exists`
-    // predicate (Ungrounded until the control plane grounds it).
+    // The hint is stored separately from active grounds; its predicate is unused.
     let draft_ground = match ground {
         Some(s) => {
             let (src, locator) = parse_source(&s, None)?;
@@ -445,11 +445,12 @@ fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()
 
     if json {
         let out = serde_json::json!({
-            "key": key,
+            "key": fact.claim.key(),
             "value": value_json(&fact.value),
             "confidence": round2(conf),
             "groundedness": groundedness_json(&fact.epistemics.groundedness),
             "grounds": grounds_json(&fact),
+            "source_hint": fact.source_hint.as_ref().map(jishuken::ground::render_ground),
             "last_verified": fact.schedule.last_verified,
             "due": due,
         });
@@ -458,6 +459,12 @@ fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()
     }
 
     println!("{key} = {}", fact.value.render());
+    if let Some(hint) = &fact.source_hint {
+        println!(
+            "  source hint  {} (awaiting `ken ground`)",
+            jishuken::ground::render_ground(hint)
+        );
+    }
     println!(
         "  confidence   {:.2}   volatility={}",
         conf,
@@ -500,8 +507,16 @@ fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()
 }
 
 fn cmd_why(store: &JishukenStore, key: &str) -> anyhow::Result<()> {
+    let canonical = Claim::parse_key(key)?.key();
+    let key = canonical.as_str();
     let fact = store.read_fact_by_key(key)?;
     println!("{key} = {}", fact.value.render());
+    if let Some(hint) = &fact.source_hint {
+        println!(
+            "  source hint  {} (awaiting `ken ground`)",
+            jishuken::ground::render_ground(hint)
+        );
+    }
     println!(
         "  ingested   {} by {}  (confidence {:.2}, ungrounded)",
         fact.provenance.ingested_at.format("%Y-%m-%d"),
@@ -599,7 +614,7 @@ fn cmd_search(
     let facts = store.all_facts()?;
     let now = Utc::now();
     let costs = store.cost_table();
-    let q = query.to_lowercase();
+    let q: String = query.to_lowercase().nfc().collect();
 
     let mut hits: Vec<&Fact> = facts
         .iter()
@@ -608,8 +623,16 @@ fn cmd_search(
                 || f.claim.key().to_lowercase().contains(&q)
                 || f.value.render().to_lowercase().contains(&q)
         })
-        .filter(|f| entity.as_ref().is_none_or(|e| &f.claim.entity.0 == e))
-        .filter(|f| relation.as_ref().is_none_or(|r| &f.claim.relation == r))
+        .filter(|f| {
+            entity
+                .as_ref()
+                .is_none_or(|e| e.nfc().eq(f.claim.entity.0.chars()))
+        })
+        .filter(|f| {
+            relation
+                .as_ref()
+                .is_none_or(|r| r.nfc().eq(f.claim.relation.chars()))
+        })
         .filter(|f| {
             grounded
                 .as_ref()

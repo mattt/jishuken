@@ -7,11 +7,12 @@
 //! Writes serialize behind a store lock; single-writer is the supported
 //! posture.
 
+mod transaction;
+
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -22,12 +23,15 @@ use crate::config::Config;
 use crate::decay::{decayed_variance, kalman_update};
 use crate::error::{Error, Result};
 use crate::ground::generator::GeneratorRegistry;
+#[cfg(test)]
+use crate::schema::legacy_path_for;
 use crate::schema::{
     path_for, Claim, Epistemics, Fact, FactId, FactValue, GeneratorHash, GroundBinding,
     Groundedness, Provenance, ScheduleMeta, Timestamp,
 };
 use crate::sketch::TDigest;
 use crate::write::{landed_confidence_with, Outcome, WriteOp};
+use transaction::{read_optional, LogUpdate};
 
 /// An op-log record id (blake3 prefix over the previous id, tag, detail, time).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,11 +49,6 @@ pub struct Operation {
 /// Initial posterior variance for a freshly ingested, unverified fact: high, so
 /// the first verifier run moves it a lot.
 const INGEST_VARIANCE: f64 = 0.25;
-
-/// A lock older than this is treated as abandoned by a crashed writer and
-/// stolen. The lock is held only for the duration of a single write, so a fresh
-/// lock always means a live writer.
-const STALE_LOCK: Duration = Duration::from_secs(30);
 
 /// One file touched by an op: its path (relative to the store root) and the
 /// bytes before and after. `before: None` means the op created the file;
@@ -111,11 +110,16 @@ impl JishukenStore {
             return Err(Error::StoreNotFound);
         }
         let config = Config::load_or_default(&root.join("ken.toml"));
-        Ok(JishukenStore {
+        let store = JishukenStore {
             root: root.to_path_buf(),
             config,
             pending: Mutex::new(Vec::new()),
-        })
+        };
+        // Recover interrupted commits before exposing the working state.
+        {
+            let _lock = store.lock()?;
+        }
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -153,8 +157,17 @@ impl JishukenStore {
         self.root.join("ops.jsonl")
     }
 
-    fn fact_path(&self, claim: &Claim) -> PathBuf {
-        self.root.join(path_for(claim))
+    fn read_text(&self, path: &str) -> Result<Option<String>> {
+        if let Some(change) = self
+            .pending
+            .lock()
+            .expect("pending lock")
+            .iter()
+            .find(|c| c.path == path)
+        {
+            return Ok(change.after.clone());
+        }
+        read_optional(&self.root.join(path))
     }
 
     /// Read a fact by its `entity.relation` key from the working copy.
@@ -163,10 +176,11 @@ impl JishukenStore {
     /// Returns an error if the key is malformed, the fact does not exist, or its
     /// file is not valid JSON.
     pub fn read_fact_by_key(&self, key: &str) -> Result<Fact> {
-        let claim = Claim::parse_key(key)?;
-        let path = self.fact_path(&claim);
-        let bytes = std::fs::read(&path).map_err(|_| Error::FactNotFound(key.to_string()))?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let key = Claim::parse_key(key)?.key();
+        self.all_facts()?
+            .into_iter()
+            .find(|f| f.claim.key() == key)
+            .ok_or(Error::FactNotFound(key))
     }
 
     /// Read a fact by id from the working copy.
@@ -178,11 +192,24 @@ impl JishukenStore {
     ///
     /// # Errors
     /// Returns an error if the `facts/` directory cannot be read.
+    ///
+    /// # Panics
+    /// Panics if another operation panicked while staging changes.
     pub fn all_facts(&self) -> Result<Vec<Fact>> {
-        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        self.fact_files()?.into_iter().map(|(_, fact)| {
+            if !seen.insert(fact.id.clone()) {
+                return Err(Error::Store(format!("multiple files normalize to key {}; resolve the duplicate before continuing", fact.id)));
+            }
+            Ok(fact)
+        }).collect()
+    }
+
+    fn fact_files(&self) -> Result<Vec<(String, Fact)>> {
+        let mut files = HashMap::new();
         let facts_dir = self.root.join("facts");
         if !facts_dir.is_dir() {
-            return Ok(out);
+            return Err(Error::Store("facts directory is missing".into()));
         }
         for entity in std::fs::read_dir(&facts_dir)? {
             let entity = entity?;
@@ -194,43 +221,145 @@ impl JishukenStore {
                 if rel.path().extension().and_then(|s| s.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(bytes) = std::fs::read(rel.path()) {
-                    if let Ok(f) = serde_json::from_slice::<Fact>(&bytes) {
-                        out.push(f);
-                    }
-                }
+                let path = rel.path();
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map_err(|e| Error::Store(e.to_string()))?
+                    .to_string_lossy()
+                    .into_owned();
+                files.insert(relative, std::fs::read_to_string(path)?);
             }
+        }
+        for change in self.pending.lock().expect("pending lock").iter() {
+            if !change.path.starts_with("facts/") {
+                continue;
+            }
+            if let Some(text) = &change.after {
+                files.insert(change.path.clone(), text.clone());
+            } else {
+                files.remove(&change.path);
+            }
+        }
+        let mut out = Vec::new();
+        let mut paths: Vec<_> = files.into_iter().collect();
+        paths.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, text) in paths {
+            out.push((path, self.decode_fact(&text)?));
         }
         Ok(out)
     }
 
-    /// Write a fact file, recording the before/after bytes on the in-flight op
-    /// so it can be undone.
-    fn write_fact(&self, fact: &Fact) -> Result<()> {
-        let path = self.fact_path(&fact.claim);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    /// Identify old ingest hints from history, preserving explicit ground bindings.
+    fn decode_fact(&self, text: &str) -> Result<Fact> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let legacy = value.get("source_hint").is_none();
+        let mut fact: Fact = serde_json::from_value(value)?;
+        fact.claim.normalize();
+        if Claim::parse_key(&fact.id.0)?.key() != fact.claim.key() {
+            return Err(Error::Store("fact ID does not match its claim".into()));
         }
-        let before = std::fs::read_to_string(&path).ok();
-        let after = String::from_utf8(serde_json::to_vec_pretty(fact)?)
-            .expect("serde_json emits valid utf-8");
-        std::fs::write(&path, &after)?;
-        self.pending.lock().expect("pending lock").push(Change {
-            path: path_for(&fact.claim),
-            before,
-            after: Some(after),
-        });
+        fact.id = FactId::for_claim(&fact.claim);
+        if !legacy || fact.grounds.is_empty() {
+            return Ok(fact);
+        }
+        // Old Ingest snapshots are the evidence that the first ground was a hint.
+        // An explicitly bound `exists` predicate must remain an active ground.
+        let records = self.read_ops()?;
+        let Some(ingest) = records.iter().rev().find(|r| {
+            r.tag == "Ingest"
+                && Claim::parse_key(&r.detail).is_ok_and(|c| c.key() == fact.claim.key())
+        }) else {
+            return Ok(fact);
+        };
+        let ingested = ingest
+            .changes
+            .iter()
+            .filter_map(|c| c.after.as_deref())
+            .filter_map(|text| serde_json::from_str::<Fact>(text).ok())
+            .find(|saved| saved.claim.key() == fact.claim.key());
+        let Some(ingested) = ingested else {
+            return Ok(fact);
+        };
+        let Some(hint) = ingested.grounds.first() else {
+            return Ok(fact);
+        };
+        let first = &fact.grounds[0];
+        if first.source == hint.source
+            && first.locator == hint.locator
+            && first.predicate == hint.predicate
+        {
+            let mut hint = fact.grounds.remove(0);
+            hint.last = None;
+            fact.source_hint = Some(hint);
+            // Discard belief updates that included the existence-only hint.
+            fact.epistemics = ingested.epistemics;
+            fact.schedule = ingested.schedule;
+            for ground in &mut fact.grounds {
+                ground.last = None;
+            }
+        }
+        Ok(fact)
+    }
+
+    /// Stage a fact and migrate its old filename when necessary.
+    fn write_fact(&self, fact: &Fact) -> Result<()> {
+        let mut fact = fact.clone();
+        fact.claim.normalize();
+        fact.id = FactId::for_claim(&fact.claim);
+        let fact = &fact;
+        let path = path_for(&fact.claim);
+        let aliases: Vec<_> = self
+            .fact_files()?
+            .into_iter()
+            .filter(|(_, saved)| saved.id == fact.id)
+            .collect();
+        if aliases.len() > 1 {
+            return Err(Error::Store(format!(
+                "multiple files normalize to key {}; resolve the duplicate before continuing",
+                fact.id
+            )));
+        }
+        for (old_path, _) in aliases {
+            if old_path != path {
+                self.stage_file(&old_path, None)?;
+            }
+        }
+        if let Some(text) = self.read_text(&path)? {
+            let saved = self.decode_fact(&text)?;
+            if saved.claim.key() != fact.claim.key() || saved.id != fact.id {
+                if path == path_for(&saved.claim) {
+                    return Err(Error::Store(format!("{path} belongs to a different fact")));
+                }
+                self.write_fact(&saved)?;
+            }
+        }
+        self.stage_file(&path, Some(serde_json::to_string_pretty(fact)?))
+    }
+
+    fn stage_file(&self, path: &str, after: Option<String>) -> Result<()> {
+        let mut pending = self.pending.lock().expect("pending lock");
+        if let Some(change) = pending.iter_mut().find(|c| c.path == path) {
+            change.after = after;
+        } else {
+            pending.push(Change {
+                path: path.to_string(),
+                before: read_optional(&self.root.join(path))?,
+                after,
+            });
+        }
         Ok(())
     }
 
-    /// Persist a fact file, recording it on the in-flight op. Control-plane
-    /// callers use this alongside [`JishukenStore::control_commit`] to land one
-    /// tagged op.
+    /// Stage a fact for the next [`JishukenStore::control_commit`].
     ///
     /// # Errors
     /// Returns an error if the fact file cannot be written.
     pub fn put_fact(&self, fact: &Fact) -> Result<()> {
-        self.write_fact(fact)
+        let result = self.write_fact(fact);
+        if result.is_err() {
+            self.discard_pending();
+        }
+        result
     }
 
     /// Append one op-log record, draining the changes the in-flight op recorded.
@@ -247,13 +376,8 @@ impl JishukenStore {
             detail: detail.to_string(),
             changes,
         };
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.ops_path())?;
-        writeln!(f, "{}", serde_json::to_string(&rec)?)?;
-        f.sync_all()?;
-        Ok(())
+        let line = format!("{}\n", serde_json::to_string(&rec)?);
+        transaction::commit(&self.root, rec.changes, LogUpdate::Append(line))
     }
 
     /// Commit the in-flight op under a tag (private; every write path ends here).
@@ -266,7 +390,16 @@ impl JishukenStore {
     /// # Errors
     /// Returns an error if the op log cannot be appended.
     pub fn control_commit(&self, tag: &str, detail: &str) -> Result<()> {
-        self.append_op(tag, detail)
+        let result = (|| {
+            let _lock = self.lock()?;
+            self.append_op(tag, detail)
+        })();
+        self.discard_pending();
+        result
+    }
+
+    fn discard_pending(&self) {
+        self.pending.lock().expect("pending lock").clear();
     }
 
     /// Read the op log, oldest first. A missing log reads as empty.
@@ -276,11 +409,15 @@ impl JishukenStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
-        Ok(text
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect())
+        text.lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+            .map(|(i, l)| {
+                serde_json::from_str(l).map_err(|e| {
+                    Error::Store(format!("invalid ops.jsonl record on line {}: {e}", i + 1))
+                })
+            })
+            .collect()
     }
 
     /// The id of the newest op-log record, or an empty string if the log is empty.
@@ -292,13 +429,10 @@ impl JishukenStore {
     }
 
     fn append_calibration(&self, sample: &CalibrationSample) -> Result<()> {
-        let path = self.root.join("calibration.jsonl");
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(f, "{}", serde_json::to_string(sample)?)?;
-        Ok(())
+        let mut text = self.read_text("calibration.jsonl")?.unwrap_or_default();
+        text.push_str(&serde_json::to_string(sample)?);
+        text.push('\n');
+        self.stage_file("calibration.jsonl", Some(text))
     }
 
     /// The logged calibration samples, or an empty list if none exist yet.
@@ -329,17 +463,14 @@ impl JishukenStore {
         }
     }
 
-    /// Fold one observed run time (seconds) into a generator's cost sketch
-    /// (Idea 2). Keyed by the content hash, so the measurement pools across
-    /// every fact that shares the generator and merges across revisions.
+    /// Stage an observed run time for the next commit, keyed by generator hash.
     ///
     /// # Errors
     /// Returns an error if the cost sketch file cannot be written.
     pub fn record_cost(&self, by: &GeneratorHash, secs: f64) -> Result<()> {
         let mut costs = self.load_costs();
         costs.entry(by.0.clone()).or_default().insert(secs);
-        std::fs::write(self.costs_path(), serde_json::to_vec_pretty(&costs)?)?;
-        Ok(())
+        self.stage_file("costs.json", Some(serde_json::to_string_pretty(&costs)?))
     }
 
     /// Materialize the median observed run time per generator, for the `VoI`
@@ -352,38 +483,43 @@ impl JishukenStore {
             .collect()
     }
 
-    /// Roll the store back one operation (`ken undo`): restore the saved bytes
-    /// of the last non-`Undo` op, then log an `[Undo]` record.
+    /// Restore the last operation's saved bytes and remove it from history.
     ///
     /// # Errors
     /// Returns an error if the log cannot be read or a file cannot be restored.
+    ///
+    /// # Panics
+    /// Panics if another operation panicked while staging changes.
     pub fn undo(&self) -> Result<()> {
         let _lock = self.lock()?;
-        let recs = self.read_ops()?;
-        let Some(rec) = recs.iter().rev().find(|r| r.tag != "Undo") else {
+        let mut recs = self.read_ops()?;
+        // Earlier versions appended Undo records without consuming the operation.
+        // A trailing group of those records has already reversed its preceding op.
+        while recs.last().is_some_and(|r| r.tag == "Undo") {
+            while recs.last().is_some_and(|r| r.tag == "Undo") {
+                recs.pop();
+            }
+            recs.pop();
+        }
+        let Some(rec) = recs.pop().filter(|r| r.tag != "Init") else {
             return Err(Error::Store("nothing to undo".into()));
         };
         // Replay in reverse so the earliest `before` for a path wins, leaving
         // each file as it was before the op ran.
-        for ch in rec.changes.iter().rev() {
-            let path = self.root.join(&ch.path);
-            match &ch.before {
-                Some(bytes) => {
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&path, bytes)?;
-                }
-                None => {
-                    if path.exists() {
-                        std::fs::remove_file(&path)?;
-                    }
-                }
+        let result = (|| {
+            for ch in rec.changes.iter().rev() {
+                self.stage_file(&ch.path, ch.before.clone())?;
             }
-        }
-        let detail = format!("{} {}", rec.tag, rec.detail);
-        self.append_op("Undo", detail.trim())?;
-        Ok(())
+            let mut log = String::new();
+            for record in recs {
+                log.push_str(&serde_json::to_string(&record)?);
+                log.push('\n');
+            }
+            let changes = std::mem::take(&mut *self.pending.lock().expect("pending lock"));
+            transaction::commit(&self.root, changes, LogUpdate::Replace(log))
+        })();
+        self.discard_pending();
+        result
     }
 
     /// The operation log, newest first, optionally truncated at `since`
@@ -435,6 +571,14 @@ impl JishukenStore {
     /// # Errors
     /// Returns an error if the facts cannot be read or rewritten.
     pub fn recompute_centrality(&self) -> Result<bool> {
+        let result = self.stage_centrality();
+        if result.is_err() {
+            self.discard_pending();
+        }
+        result
+    }
+
+    fn stage_centrality(&self) -> Result<bool> {
         let mut facts = self.all_facts()?;
         if facts.is_empty() {
             return Ok(false);
@@ -483,15 +627,22 @@ impl JishukenStore {
 
     fn apply_op(&self, op: WriteOp, recompute_centrality: bool) -> Result<FactId> {
         let _lock = self.lock()?;
+        let result = self.apply_staged(op, recompute_centrality);
+        self.discard_pending();
+        result
+    }
+
+    fn apply_staged(&self, op: WriteOp, recompute_centrality: bool) -> Result<FactId> {
         let tag = op.tag();
         match op {
             WriteOp::Ingest {
-                claim,
+                mut claim,
                 value,
                 triage,
                 volatility,
                 draft_ground,
             } => {
+                claim.normalize();
                 let now = Utc::now();
                 let id = FactId::for_claim(&claim);
                 // Calibrate the LLM triage that produced this prior. The
@@ -513,9 +664,11 @@ impl JishukenStore {
                         variance_at_verify: INGEST_VARIANCE,
                         priority: 0.0,
                     },
-                    // A `--ground` hint lands as a draft binding (no verifier,
-                    // unchecked); it does not move groundedness.
-                    grounds: draft_ground.into_iter().collect(),
+                    grounds: Vec::new(),
+                    source_hint: draft_ground.map(|mut hint| {
+                        hint.last = None;
+                        hint
+                    }),
                     provenance: Provenance {
                         ingested_by: whoami(),
                         ingested_at: now,
@@ -539,6 +692,7 @@ impl JishukenStore {
                     crate::ground::render_ground(&binding)
                 );
                 fact.grounds.push(binding);
+                fact.source_hint = None;
                 self.write_fact(&fact)?;
                 self.commit(&tag, &detail)?;
                 Ok(id)
@@ -629,52 +783,28 @@ impl JishukenStore {
         }
     }
 
-    /// Take the store's exclusive write lock. A crashed writer's lock (older
-    /// than [`STALE_LOCK`]) is stolen; a fresh one is refused.
-    fn lock(&self) -> Result<LockGuard> {
+    /// Hold an OS lock until the returned file closes, including on process exit.
+    fn lock(&self) -> Result<std::fs::File> {
         let path = self.root.join("lock");
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    let _ = write!(f, "{}", std::process::id());
-                    return Ok(LockGuard { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| t.elapsed().map(|d| d > STALE_LOCK).unwrap_or(true))
-                        .unwrap_or(false);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
-                    }
-                    let pid = std::fs::read_to_string(&path).unwrap_or_default();
-                    return Err(Error::Store(format!(
-                        "store is locked by pid {}; remove {} if no ken is running",
-                        pid.trim(),
-                        path.display()
-                    )));
-                }
-                Err(e) => return Err(e.into()),
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::Store(
+                    "store is locked by another writer; retry when it finishes".into(),
+                ));
             }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        Err(Error::Store("could not acquire store lock".into()))
-    }
-}
-
-/// Releases the store lock file on drop.
-#[derive(Debug)]
-struct LockGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        file.set_len(0)?;
+        write!(file, "{}", std::process::id())?;
+        transaction::recover(&self.root)?;
+        Ok(file)
     }
 }
 
@@ -738,7 +868,7 @@ fn whoami() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_groundedness, JishukenStore, OpId};
+    use super::{aggregate_groundedness, legacy_path_for, JishukenStore, OpId};
     use crate::ground::locator::parse_source;
     use crate::predicate::Predicate;
     use crate::schema::{
@@ -787,14 +917,282 @@ mod tests {
             store.read_fact_by_key("db.host").is_err(),
             "undo should remove the created fact file"
         );
-        assert!(
+        assert_eq!(store.op_log(None).unwrap().len(), 1);
+        assert!(store.undo().is_err(), "Init is not an undoable operation");
+    }
+
+    #[test]
+    fn keys_remain_distinct_on_case_insensitive_filesystems() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let keys = [
+            "service.api.owner",
+            "service_api.owner",
+            "Service.api.owner",
+            "service/api.owner",
+            "service%2Eapi.owner",
+            "日本.owner",
+            "語.owner",
+            "release.Owner",
+            "release.owner",
+            "../../escape.value",
+        ];
+        let mut paths = std::collections::HashSet::new();
+        for key in keys {
             store
-                .op_log(None)
-                .unwrap()
-                .iter()
-                .any(|o| o.description.contains("[Undo]")),
-            "undo is itself recorded in the op log"
+                .apply(WriteOp::ingest(
+                    Claim::parse_key(key).unwrap(),
+                    scalar(key),
+                    TriageSource::Ingest,
+                    Volatility::Days,
+                    None,
+                ))
+                .unwrap();
+            let path = super::path_for(&Claim::parse_key(key).unwrap());
+            assert!(paths.insert(path.to_lowercase()));
+            assert!(store.root().join(path).is_file());
+        }
+        for key in keys {
+            assert_eq!(store.read_fact_by_key(key).unwrap().value.render(), key);
+        }
+        assert_eq!(store.all_facts().unwrap().len(), keys.len());
+    }
+
+    #[test]
+    fn legacy_collision_migrates_without_losing_either_fact_and_can_be_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        ingest(&store, "service.api.owner");
+        let claim = Claim::parse_key("service.api.owner").unwrap();
+        let encoded = store.root().join(super::path_for(&claim));
+        let legacy = store.root().join(super::legacy_path_for(&claim));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::rename(&encoded, &legacy).unwrap();
+        assert!(store.read_fact_by_key("service_api.owner").is_err());
+        assert!(store.read_fact_by_key("service.api.owner").is_ok());
+        ingest(&store, "service_api.owner");
+        assert!(encoded.is_file());
+        assert!(store.read_fact_by_key("service_api.owner").is_ok());
+        assert!(store.read_fact_by_key("service.api.owner").is_ok());
+        assert_eq!(store.all_facts().unwrap().len(), 2);
+        store.undo().unwrap();
+        assert!(!encoded.exists());
+        assert!(legacy.is_file());
+        assert!(store.read_fact_by_key("service_api.owner").is_err());
+        assert_eq!(store.all_facts().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn log_failure_leaves_facts_unchanged_and_does_not_leak_into_a_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        ingest(&store, "release.owner");
+        let before = store.read_fact_by_key("release.owner").unwrap();
+        let log = store.ops_path();
+        let backup = store.root().join("ops.backup");
+        std::fs::rename(&log, &backup).unwrap();
+        std::fs::create_dir(&log).unwrap();
+        assert!(store
+            .apply(WriteOp::ingest(
+                before.claim.clone(),
+                scalar("new"),
+                TriageSource::Ingest,
+                Volatility::Days,
+                None
+            ))
+            .is_err());
+        assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+        assert!(store.pending.lock().unwrap().is_empty());
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::rename(backup, log).unwrap();
+        ingest(&store, "other.owner");
+        store.undo().unwrap();
+        assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+        assert_eq!(store.op_log(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn malformed_log_is_reported_before_writing_a_fact() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        ingest(&store, "release.owner");
+        let before = store.read_fact_by_key("release.owner").unwrap();
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.ops_path())
+            .unwrap();
+        writeln!(log, "{{broken record").unwrap();
+        let error = store
+            .apply(WriteOp::ingest(
+                before.claim.clone(),
+                scalar("new"),
+                TriageSource::Ingest,
+                Volatility::Days,
+                None,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("line 3"));
+        assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+    }
+
+    #[test]
+    fn canonical_unicode_keys_share_identity_and_undo_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        for (composed, decomposed) in [
+            ("café.rôle", "cafe\u{0301}.ro\u{0302}le"),
+            ("각.owner", "\u{1100}\u{1161}\u{11a8}.owner"),
+            ("q\u{0323}\u{0307}.owner", "q\u{0307}\u{0323}.owner"),
+        ] {
+            let first = Claim::parse_key(composed).unwrap();
+            let second = Claim::parse_key(decomposed).unwrap();
+            assert_eq!(first, second);
+            assert_eq!(super::path_for(&first), super::path_for(&second));
+            // Construct an unnormalized claim directly to exercise the library boundary.
+            let (entity, relation) = decomposed.rsplit_once('.').unwrap();
+            let raw = Claim {
+                entity: crate::schema::EntityId(entity.into()),
+                relation: relation.into(),
+                nl: None,
+            };
+            let id = store
+                .apply(WriteOp::ingest(
+                    raw,
+                    scalar("first"),
+                    TriageSource::Ingest,
+                    Volatility::Days,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(id.0, first.key());
+            let fact = store.read_fact_by_key(composed).unwrap();
+            assert_eq!(fact.claim, first);
+            store
+                .apply(WriteOp::ingest(
+                    second,
+                    scalar("second"),
+                    TriageSource::Ingest,
+                    Volatility::Days,
+                    None,
+                ))
+                .unwrap();
+            assert_eq!(
+                store.read_fact_by_key(decomposed).unwrap().value.render(),
+                "second"
+            );
+            store.undo().unwrap();
+            assert_eq!(store.read_fact_by_key(decomposed).unwrap(), fact);
+        }
+        assert_eq!(store.all_facts().unwrap().len(), 3);
+        for key in [
+            "café.owner",
+            "Café.owner",
+            "①.owner",
+            "1.owner",
+            "Ａ.owner",
+            "A.owner",
+        ] {
+            ingest(&store, key);
+        }
+        assert_eq!(store.all_facts().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn non_normalized_legacy_keys_migrate_and_duplicates_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let mut fact = verified_scalar("café.owner");
+        fact.claim.entity.0 = "cafe\u{0301}".into();
+        fact.id.0 = "cafe\u{0301}.owner".into();
+        let legacy = dir.path().join(legacy_path_for(&fact.claim));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&fact).unwrap()).unwrap();
+        assert_eq!(
+            store.read_fact_by_key("café.owner").unwrap().id.0,
+            "café.owner"
         );
+        ingest(&store, "café.owner");
+        assert!(!legacy.exists());
+        let canonical = dir.path().join(super::path_for(&fact.claim));
+        let before = std::fs::read(&canonical).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&fact).unwrap()).unwrap();
+        assert!(store
+            .read_fact_by_key("café.owner")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple files normalize"));
+        assert!(store
+            .apply(WriteOp::ingest(
+                Claim::parse_key("café.owner").unwrap(),
+                scalar("replace"),
+                TriageSource::Ingest,
+                Volatility::Days,
+                None
+            ))
+            .is_err());
+        assert_eq!(std::fs::read(canonical).unwrap(), before);
+        assert!(legacy.is_file());
+    }
+
+    #[test]
+    fn legacy_ingest_hints_are_disarmed_but_explicit_grounds_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        for draft in [false, true] {
+            let key = if draft { "hint.owner" } else { "bound.owner" };
+            ingest(&store, key);
+            let mut fact = store.read_fact_by_key(key).unwrap();
+            let unchecked = ground_with(None);
+            // Reproduce the old representation in the Ingest op and working fact.
+            let mut records = store.read_ops().unwrap();
+            let ingest = records.last_mut().unwrap();
+            if draft {
+                fact.grounds.push(unchecked.clone());
+            }
+            let mut snapshot = serde_json::to_value(&fact).unwrap();
+            snapshot.as_object_mut().unwrap().remove("source_hint");
+            ingest.changes[0].after = Some(snapshot.to_string());
+            let mut log = String::new();
+            for record in &records {
+                log.push_str(&serde_json::to_string(record).unwrap());
+                log.push('\n');
+            }
+            std::fs::write(store.ops_path(), log).unwrap();
+            fact.grounds = vec![ground_with(Some(Outcome::Confirmed))];
+            fact.epistemics.groundedness = Groundedness::Verified {
+                at: Utc::now(),
+                by: GeneratorHash("existence".into()),
+            };
+            fact.epistemics.confidence = 0.9;
+            let mut saved = serde_json::to_value(&fact).unwrap();
+            saved.as_object_mut().unwrap().remove("source_hint");
+            std::fs::write(store.root().join(fact.rel_path()), saved.to_string()).unwrap();
+            let loaded = store.read_fact_by_key(key).unwrap();
+            if draft {
+                assert!(loaded.grounds.is_empty());
+                assert!(loaded.source_hint.is_some());
+                assert!(matches!(
+                    loaded.epistemics.groundedness,
+                    Groundedness::Ungrounded { .. }
+                ));
+                assert_eq!(loaded.epistemics.confidence, 0.4);
+            } else {
+                assert_eq!(loaded, fact);
+            }
+        }
+    }
+
+    #[test]
+    fn live_lock_is_never_stolen_based_on_its_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let lock = store.lock().unwrap();
+        lock.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        assert!(JishukenStore::open(dir.path()).is_err());
+        drop(lock);
+        JishukenStore::open(dir.path()).unwrap();
     }
 
     #[test]

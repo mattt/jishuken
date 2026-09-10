@@ -25,7 +25,12 @@ fn ground_file(store: &JishukenStore, key: &str, source: &str, predicate: &str) 
 
 /// Bind a ground via a locator string, resolving handler-backed schemes through
 /// config, then check it.
-fn ground_via_config(store: &JishukenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
+fn ground_via_config(
+    store: &JishukenStore,
+    key: &str,
+    source: &str,
+    predicate: &str,
+) -> Groundedness {
     let (src, locator) = parse_source(source, None).unwrap();
     let source = jishuken::ground::ground_source_for(store.config(), store.root(), src).unwrap();
     let binding = GroundBinding {
@@ -43,7 +48,12 @@ fn fresh_store() -> (tempfile::TempDir, JishukenStore) {
     (dir, store)
 }
 
-fn ingest(store: &JishukenStore, key: &str, value: &str, vol: Volatility) -> jishuken::schema::FactId {
+fn ingest(
+    store: &JishukenStore,
+    key: &str,
+    value: &str,
+    vol: Volatility,
+) -> jishuken::schema::FactId {
     let claim = Claim::parse_key(key).unwrap();
     store
         .apply(WriteOp::ingest(
@@ -104,23 +114,125 @@ fn recall_reads_the_ingested_fact_file() {
 #[test]
 fn undo_rolls_back_one_operation() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "a.b", "1", Volatility::Days);
-    assert!(store.read_fact_by_key("a.b").is_ok());
-    // `ken undo` restores the saved bytes of the last op: the created fact file
-    // is removed, and the undo itself is recorded as an op.
+    for value in ["A", "B", "C"] {
+        ingest(&store, "a.b", value, Volatility::Days);
+    }
+    assert_eq!(store.op_log(None).unwrap().len(), 4);
+    store.undo().unwrap();
+    assert_eq!(store.read_fact_by_key("a.b").unwrap().value.render(), "B");
+    store.undo().unwrap();
+    assert_eq!(store.read_fact_by_key("a.b").unwrap().value.render(), "A");
+    assert_eq!(store.op_log(None).unwrap().len(), 2);
+    ingest(&store, "a.b", "D", Volatility::Days);
+    store.undo().unwrap();
+    assert_eq!(store.read_fact_by_key("a.b").unwrap().value.render(), "A");
     store.undo().unwrap();
     assert!(
         store.read_fact_by_key("a.b").is_err(),
         "undo should remove the created fact"
     );
-    assert!(
-        store
-            .op_log(None)
-            .unwrap()
-            .iter()
-            .any(|o| o.description.contains("[Undo]")),
-        "undo is itself recorded in the op log"
+    assert_eq!(store.op_log(None).unwrap().len(), 1);
+    assert!(store.undo().is_err());
+}
+
+#[test]
+fn undo_restores_verification_calibration_and_centrality_together() {
+    let (_dir, store) = fresh_store();
+    ingest(&store, "release.owner", "alice", Volatility::Days);
+    std::fs::write(store.root().join("owner.txt"), "alice").unwrap();
+    ground_file(&store, "release.owner", "store:owner.txt", "equals");
+    let before = store.read_fact_by_key("release.owner").unwrap();
+    let calibration = std::fs::read(store.root().join("calibration.jsonl")).unwrap();
+    std::fs::write(store.root().join("owner.txt"), "bob").unwrap();
+    assert!(matches!(
+        engine::verify_fact(&store, "release.owner").unwrap(),
+        Groundedness::Refuted { .. }
+    ));
+    store.undo().unwrap();
+    assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+    assert_eq!(
+        std::fs::read(store.root().join("calibration.jsonl")).unwrap(),
+        calibration
     );
+}
+
+#[test]
+fn cli_source_hints_require_an_explicit_ground_and_predicate() {
+    let (_dir, store) = fresh_store();
+    std::fs::write(store.root().join("owner.txt"), "The owner is bob.").unwrap();
+    ken_cli(
+        &store,
+        &[
+            "add",
+            "release.owner",
+            "alice",
+            "--ground",
+            "store:owner.txt",
+        ],
+    );
+    let before = store.read_fact_by_key("release.owner").unwrap();
+    assert!(before.grounds.is_empty());
+    assert!(!before.is_checkable());
+    assert!(before.source_hint.is_some());
+    assert!(ken_cli(&store, &["tick"]).contains("nothing due"));
+    assert!(engine::verify_fact(&store, "release.owner").is_err());
+    assert!(engine::audit_fact(&store, "release.owner", true).is_err());
+    assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+    let recalled: serde_json::Value =
+        serde_json::from_str(&ken_cli(&store, &["recall", "release.owner", "--json"])).unwrap();
+    assert_eq!(recalled["source_hint"], "store:owner.txt");
+    assert_eq!(recalled["groundedness"]["state"], "ungrounded");
+    let missing = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
+        .arg("--store")
+        .arg(store.root())
+        .args(["ground", "release.owner", "--source", "store:owner.txt"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--predicate"));
+    ken_cli(
+        &store,
+        &[
+            "ground",
+            "release.owner",
+            "--source",
+            "store:owner.txt",
+            "--predicate",
+            "contains",
+        ],
+    );
+    let fact = store.read_fact_by_key("release.owner").unwrap();
+    assert!(matches!(
+        fact.epistemics.groundedness,
+        Groundedness::Refuted { .. }
+    ));
+    assert!(fact.source_hint.is_none());
+}
+
+#[test]
+fn cli_normalizes_keys_and_search_filters_without_changing_values() {
+    let (_dir, store) = fresh_store();
+    let decomposed = "cafe\u{0301}.ro\u{0302}le";
+    let value = "value with e\u{0301}";
+    ken_cli(&store, &["add", decomposed, value]);
+    let recalled: serde_json::Value =
+        serde_json::from_str(&ken_cli(&store, &["recall", "café.rôle", "--json"])).unwrap();
+    assert_eq!(recalled["key"], "café.rôle");
+    assert_eq!(recalled["value"], value);
+    let searched: serde_json::Value = serde_json::from_str(&ken_cli(
+        &store,
+        &[
+            "search",
+            "--entity",
+            "cafe\u{0301}",
+            "--relation",
+            "ro\u{0302}le",
+            "--json",
+        ],
+    ))
+    .unwrap();
+    assert_eq!(searched["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(searched["matches"][0]["key"], "café.rôle");
 }
 
 #[test]
@@ -431,6 +543,8 @@ fn cli_ground_verify_recall_roundtrip() {
             "svc.port",
             "--source",
             "store:cfg.txt?q=\"port = 8080\"",
+            "--predicate",
+            "contains",
         ],
     );
     assert!(out.contains("verified"), "ground should verify: {out}");
@@ -498,6 +612,8 @@ fn cli_tick_checks_due_facts() {
             "thing.exists",
             "--source",
             "store:d.txt?q=\"present\"",
+            "--predicate",
+            "exists",
         ],
     );
 
@@ -521,6 +637,8 @@ fn cli_calibration_reports_accumulated_samples() {
             "one.fact",
             "--source",
             "store:a.txt?q=\"value present\"",
+            "--predicate",
+            "equals",
         ],
     );
     // A refuted check logs a second sample.
@@ -532,6 +650,8 @@ fn cli_calibration_reports_accumulated_samples() {
             "two.fact",
             "--source",
             "store:a.txt?q=\"no such span\"",
+            "--predicate",
+            "equals",
         ],
     );
 

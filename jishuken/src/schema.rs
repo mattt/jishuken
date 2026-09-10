@@ -3,6 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 pub type Timestamp = DateTime<Utc>;
 pub type Symbol = String;
@@ -55,14 +56,21 @@ impl Claim {
             return Err(KeyError::Missing);
         }
         Ok(Claim {
-            entity: EntityId(entity.to_string()),
-            relation: relation.to_string(),
+            entity: EntityId(entity.nfc().collect()),
+            relation: relation.nfc().collect(),
             nl: None,
         })
     }
 
     pub fn key(&self) -> String {
         format!("{}.{}", self.entity.0, self.relation)
+            .nfc()
+            .collect()
+    }
+
+    pub(crate) fn normalize(&mut self) {
+        self.entity.0 = self.entity.0.nfc().collect();
+        self.relation = self.relation.nfc().collect();
     }
 }
 
@@ -525,6 +533,10 @@ pub struct Fact {
     /// Empty until the control plane binds one.
     #[serde(default)]
     pub grounds: Vec<GroundBinding>,
+    /// A suggested source, awaiting an explicit control-plane binding.
+    /// Hints are never scheduled or counted as evidence.
+    #[serde(default)]
+    pub source_hint: Option<GroundBinding>,
     pub provenance: Provenance,
 }
 
@@ -551,22 +563,46 @@ impl Fact {
 pub fn path_for(claim: &Claim) -> String {
     format!(
         "facts/{}/{}.json",
-        sanitize(&claim.entity.0),
-        sanitize(&claim.relation)
+        encode_component(&claim.entity.0.nfc().collect::<String>()),
+        encode_component(&claim.relation.nfc().collect::<String>())
     )
 }
 
-/// Keep keys filesystem-safe while staying greppable.
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+/// Escape UTF-8 bytes, including uppercase letters for case-insensitive filesystems.
+fn encode_component(s: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::new();
+    for byte in s.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_') {
+            encoded.push(char::from(byte));
+        } else {
+            write!(encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    encoded
+}
+
+/// Earlier stores replaced punctuation with underscores.
+/// Only use this path after checking the saved claim's identity.
+#[cfg(test)]
+pub(crate) fn legacy_path_for(claim: &Claim) -> String {
+    let sanitize = |s: &str| {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    format!(
+        "facts/{}/{}.json",
+        sanitize(&claim.entity.0),
+        sanitize(&claim.relation)
+    )
 }
 
 #[cfg(test)]

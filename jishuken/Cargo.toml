@@ -2,6 +2,7 @@
 name = "jishuken"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Jishuken: self-verifying memory for agents, backed by fact files and an op log."
@@ -35,8 +36,7 @@ toml.workspace = true
 regex.workspace = true
 rmcp.workspace = true
 tokio.workspace = true
-
-[dev-dependencies]
+unicode-normalization.workspace = true
 tempfile = "3"
 
 [lints]

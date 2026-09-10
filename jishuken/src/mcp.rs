@@ -37,6 +37,7 @@ use rmcp::{
     ServerHandler, ServiceExt,
 };
 use serde_json::{json, Value};
+use unicode_normalization::UnicodeNormalization;
 
 /// What every connecting agent is told about the store before it acts.
 /// The epistemics discipline and the trust boundary made legible.
@@ -54,10 +55,10 @@ This is ken's data plane. You can recall, search, and ingest, and browse facts a
 resources. You cannot verify, ground, override belief, or grant capabilities here, \
 by design, so that ingesting an untrusted page can never mark a fact verified. An \
 ingested fact always lands `ungrounded`; name where it should be checked with the \
-`ground` hint so the scheduler can verify it later. If you confirm against a live \
-source that a stored value has changed, re-ingest the corrected value with a `ground` \
-hint: it lands `ungrounded`, which raises its re-verification priority for the next \
-scheduler tick. That is how you flag a stale fact; you cannot mark it verified yourself.
+`ground` hint. The owner must bind a source and predicate with `ken ground` before \
+the scheduler can check it. If you confirm against a live source that a stored value \
+has changed, re-ingest the corrected value with a `ground` hint. This replaces its \
+grounds and leaves it ungrounded until the owner binds it again.
 
 Recall takes an exact `entity.relation` key; use search for free text. Search \
 tokenizes the query, so multi-word queries match. `conflicts` is a single fact whose \
@@ -89,7 +90,7 @@ pub struct IngestParams {
     meta_confidence: Option<f64>,
     /// Where this should be checked, e.g. `src/auth/verify.rs` or
     /// `wiki:Architecture.md#authentication`. A hint only: the fact stays
-    /// `ungrounded` until the control plane checks it.
+    /// `ungrounded` until the owner binds a source and predicate with `ken ground`.
     ground: Option<String>,
 }
 
@@ -111,12 +112,15 @@ pub struct RecallOutput {
     key: String,
     /// The stored value: a scalar, or the array of a set-valued fact.
     value: Value,
-    /// How much to believe it, in [0,1], after time decay. Not a measure of
+    /// How much to believe it, in `[0,1]`, after time decay. Not a measure of
     /// whether it was ever checked; read `groundedness` for that.
     confidence: f64,
     groundedness: GroundednessOut,
     /// Independent groundings bound to this fact.
     grounds: Vec<GroundOut>,
+    /// Suggested source awaiting an explicit binding; never used by the scheduler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_hint: Option<String>,
     /// When the fact was last confirmed or refuted (RFC 3339).
     last_verified: String,
     /// When it next falls due for a re-check (RFC 3339); absent if it never decays.
@@ -176,7 +180,7 @@ impl JishukenServer {
     }
 
     #[tool(
-        description = "Remember a fact. Always lands ungrounded (a belief, not a checked truth). Name where it should be checked with `ground`. Returns the fact id. Re-ingesting an existing key supersedes its value and lands ungrounded again, which raises its re-verification priority for the next scheduler tick: the data-plane way to flag a fact you have seen change.",
+        description = "Remember a fact. Always lands ungrounded. Suggest a source with `ground`; the owner must bind a source and predicate with `ken ground` before verification. Returns the fact id. Re-ingesting an existing key replaces its value and grounds and leaves it ungrounded again.",
         annotations(
             title = "Remember a fact",
             read_only_hint = false,
@@ -199,10 +203,7 @@ impl JishukenServer {
             },
             None => TriageSource::Ingest,
         };
-        // `ground` is a hint: a draft binding with the default Exists
-        // predicate.
-        // Naming a source is not grounding against it; the fact stays
-        // ungrounded until the control plane checks it.
+        // Hints are stored separately from active grounds; the predicate is unused.
         let draft_ground = match p.ground.as_deref() {
             Some(s) => {
                 let (src, locator) = parse_source(s, None).map_err(|e| e.to_string())?;
@@ -250,8 +251,16 @@ impl JishukenServer {
         let facts = store.all_facts().map_err(|e| e.to_string())?;
         let mut ranked: Vec<(usize, &Fact)> = facts
             .iter()
-            .filter(|f| p.entity.as_ref().is_none_or(|e| &f.claim.entity.0 == e))
-            .filter(|f| p.relation.as_ref().is_none_or(|r| &f.claim.relation == r))
+            .filter(|f| {
+                p.entity
+                    .as_ref()
+                    .is_none_or(|e| e.nfc().eq(f.claim.entity.0.chars()))
+            })
+            .filter(|f| {
+                p.relation
+                    .as_ref()
+                    .is_none_or(|r| r.nfc().eq(f.claim.relation.chars()))
+            })
             .filter(|f| {
                 p.grounded
                     .as_ref()
@@ -340,11 +349,12 @@ fn recall_output(store: &JishukenStore, key: &str) -> Result<RecallOutput, Strin
         (fact.schedule.last_verified + chrono::Duration::seconds(hl as i64)).to_rfc3339()
     });
     Ok(RecallOutput {
-        key: key.to_string(),
+        key: fact.claim.key(),
         value: value_of(&fact.value),
         confidence: round2(conf),
         groundedness: groundedness_out(&fact.epistemics.groundedness),
         grounds: grounds_out(&fact),
+        source_hint: fact.source_hint.as_ref().map(render_ground),
         last_verified: fact.schedule.last_verified.to_rfc3339(),
         due,
     })
@@ -411,6 +421,8 @@ fn stale_value(store: &JishukenStore) -> Result<Value, String> {
 /// Provenance back to the ground sources (the `ken why` answer, as JSON): where
 /// the fact came from, the ground checks against it, and whether they disagree.
 fn why_value(store: &JishukenStore, key: &str) -> Result<Value, String> {
+    let canonical = Claim::parse_key(key).map_err(|e| e.to_string())?.key();
+    let key = canonical.as_str();
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
     let mut ops = store.op_log(None).map_err(|e| e.to_string())?;
     ops.reverse();
@@ -434,6 +446,7 @@ fn why_value(store: &JishukenStore, key: &str) -> Result<Value, String> {
         "ingested_at": fact.provenance.ingested_at.to_rfc3339(),
         "checks": checks,
         "grounds": serde_json::to_value(grounds_out(&fact)).unwrap_or_default(),
+        "source_hint": fact.source_hint.as_ref().map(render_ground),
         "conflicted": matches!(fact.epistemics.groundedness, Groundedness::Conflicted { .. }),
     }))
 }
@@ -502,6 +515,8 @@ fn truncate(s: &str, max: usize) -> String {
 fn query_tokens(query: &str) -> Vec<String> {
     query
         .to_lowercase()
+        .nfc()
+        .collect::<String>()
         .split_whitespace()
         .map(str::to_string)
         .collect()
@@ -607,7 +622,7 @@ fn prompt_messages(
                  it can be checked (a file path, a command, or a `scheme:reference`). Skip \
                  anything that is a transient detail, an opinion, or belongs in a RAG corpus \
                  rather than as a verifiable claim. Every ingested fact lands ungrounded; the \
-                 ground hint is what lets the scheduler verify it later."
+                 owner must bind a source and predicate with `ken ground` before the scheduler can verify it."
             )
         }
         PROMPT_CHECK_MEMORY => {
@@ -622,8 +637,8 @@ fn prompt_messages(
                  both confirming and refuting grounds; surface that disagreement. Prefer recently verified, \
                  high-confidence facts; treat stale or ungrounded ones as leads to confirm, \
                  not as settled truth. If you confirm against a live source that a stored \
-                 value has changed, re-ingest the corrected value with a ground hint so the \
-                 scheduler re-verifies it; you cannot mark it verified yourself."
+                 value has changed, re-ingest the corrected value with a ground hint. The \
+                 owner must bind it with `ken ground` before verification resumes."
             )
         }
         _ => return None,
@@ -637,7 +652,7 @@ fn completion_values(store: &JishukenStore, arg_name: &str, partial: &str) -> Ve
     let Ok(facts) = store.all_facts() else {
         return Vec::new();
     };
-    let needle = partial.to_lowercase();
+    let needle: String = partial.to_lowercase().nfc().collect();
     let mut values: Vec<String> = match arg_name {
         "entity" => facts.iter().map(|f| f.claim.entity.0.clone()).collect(),
         "relation" => facts.iter().map(|f| f.claim.relation.clone()).collect(),
@@ -962,6 +977,60 @@ mod tests {
             distrusted.contains(&"checkout.v2_enabled"),
             "a lone refuted ground should surface as distrusted: {conflicts}"
         );
+    }
+
+    #[test]
+    fn ingest_hint_is_visible_but_never_scheduled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("owner.txt"), "bob").unwrap();
+        let server = JishukenServer {
+            store_path: dir.path().to_path_buf(),
+        };
+        let mut params = ingest_params("release.owner", "alice");
+        params.ground = Some("store:owner.txt".into());
+        server.ken_ingest(Parameters(params)).unwrap();
+        let before = store.read_fact_by_key("release.owner").unwrap();
+        assert!(jishuken::engine::tick(&store).unwrap().is_empty());
+        assert_eq!(store.read_fact_by_key("release.owner").unwrap(), before);
+        let recalled = server
+            .ken_recall(Parameters(RecallParams {
+                key: "release.owner".into(),
+            }))
+            .unwrap();
+        assert_eq!(recalled.0.groundedness.state, "ungrounded");
+        assert_eq!(recalled.0.source_hint.as_deref(), Some("store:owner.txt"));
+        assert!(recalled.0.grounds.is_empty());
+    }
+
+    #[test]
+    fn canonical_keys_work_through_mcp_ingest_recall_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        JishukenStore::init(dir.path()).unwrap();
+        let server = JishukenServer {
+            store_path: dir.path().to_path_buf(),
+        };
+        let key = "cafe\u{0301}.ro\u{0302}le";
+        server
+            .ken_ingest(Parameters(ingest_params(key, "alice")))
+            .unwrap();
+        let recalled = server
+            .ken_recall(Parameters(RecallParams { key: key.into() }))
+            .unwrap();
+        assert_eq!(recalled.0.key, "café.rôle");
+        let result = server
+            .ken_search(Parameters(SearchParams {
+                query: "cafe\u{0301}".into(),
+                entity: Some("cafe\u{0301}".into()),
+                relation: Some("ro\u{0302}le".into()),
+                grounded: None,
+            }))
+            .unwrap();
+        let output = serde_json::to_value(result).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(output["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["matches"][0]["key"], "café.rôle");
     }
 
     fn ground(store: &JishukenStore, key: &str, source: &str) {

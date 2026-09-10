@@ -1,4 +1,4 @@
-//! Jishuken (`ken`): memory for agents with scheduled verification.
+//! Jishuken: memory for agents with scheduled verification.
 //!
 //! The store holds fact files and an append-only operation log.
 //! See the [README](https://github.com/mattt/jishuken#readme) for usage,
