@@ -1,18 +1,18 @@
 //! End-to-end tests against a real store: a `.ken/` directory of fact files and
 //! an append-only op log, no external VCS required.
 
-use ken::engine;
-use ken::ground::locator::parse_source;
-use ken::predicate::Predicate;
-use ken::schema::{
+use jishuken::engine;
+use jishuken::ground::locator::parse_source;
+use jishuken::predicate::Predicate;
+use jishuken::schema::{
     Claim, CommandSource, FactValue, GroundBinding, GroundSource, Groundedness, SourceRoot,
     TriageSource, Volatility,
 };
-use ken::store::{KenStore, OpId};
-use ken::write::{WriteOp, INGEST_CONFIDENCE_CEILING};
+use jishuken::store::{JishukenStore, OpId};
+use jishuken::write::{WriteOp, INGEST_CONFIDENCE_CEILING};
 
 /// Bind a File ground via a locator string + predicate spec, then check it.
-fn ground_file(store: &KenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
+fn ground_file(store: &JishukenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
     let (src, locator) = parse_source(source, None).unwrap();
     let binding = GroundBinding {
         source: GroundSource::File(src),
@@ -25,9 +25,9 @@ fn ground_file(store: &KenStore, key: &str, source: &str, predicate: &str) -> Gr
 
 /// Bind a ground via a locator string, resolving handler-backed schemes through
 /// config, then check it.
-fn ground_via_config(store: &KenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
+fn ground_via_config(store: &JishukenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
     let (src, locator) = parse_source(source, None).unwrap();
-    let source = ken::ground::ground_source_for(store.config(), store.root(), src).unwrap();
+    let source = jishuken::ground::ground_source_for(store.config(), store.root(), src).unwrap();
     let binding = GroundBinding {
         source,
         locator,
@@ -37,13 +37,13 @@ fn ground_via_config(store: &KenStore, key: &str, source: &str, predicate: &str)
     engine::ground(store, key, binding).unwrap()
 }
 
-fn fresh_store() -> (tempfile::TempDir, KenStore) {
+fn fresh_store() -> (tempfile::TempDir, JishukenStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+    let store = JishukenStore::init(&dir.path().join(".ken")).unwrap();
     (dir, store)
 }
 
-fn ingest(store: &KenStore, key: &str, value: &str, vol: Volatility) -> ken::schema::FactId {
+fn ingest(store: &JishukenStore, key: &str, value: &str, vol: Volatility) -> jishuken::schema::FactId {
     let claim = Claim::parse_key(key).unwrap();
     store
         .apply(WriteOp::ingest(
@@ -128,7 +128,7 @@ fn discovery_walks_up_for_dot_ken() {
     let (dir, _store) = fresh_store();
     let nested = dir.path().join("src").join("deep");
     std::fs::create_dir_all(&nested).unwrap();
-    let found = KenStore::discover(None, &nested).unwrap();
+    let found = JishukenStore::discover(None, &nested).unwrap();
     assert_eq!(found.root(), dir.path().join(".ken"));
 }
 
@@ -244,7 +244,7 @@ fn concurrent_tick_checks_all_and_coalesces_centrality() {
         .to_toml()
         .replace("concurrency = 1", "concurrency = 4");
     std::fs::write(store.root().join("ken.toml"), toml).unwrap();
-    let store = KenStore::open(store.root()).unwrap();
+    let store = JishukenStore::open(store.root()).unwrap();
 
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     let keys = ["a.exists", "b.exists", "c.exists", "d.exists"];
@@ -342,7 +342,7 @@ fn command_allowlist_denies_unlisted_program() {
             argv: vec!["echo".into(), "ok".into()],
             root: SourceRoot::Store,
         }),
-        locator: ken::schema::Locator::Whole,
+        locator: jishuken::schema::Locator::Whole,
         predicate: Predicate::Exists,
         last: None,
     };
@@ -360,7 +360,7 @@ fn command_allowlist_denies_unlisted_program() {
 #[test]
 fn handler_scheme_grounds_with_locator_projection() {
     let (_dir, store) = fresh_store();
-    if !ken::ground::Sandbox::new("deno", std::time::Duration::from_secs(10)).available() {
+    if !jishuken::ground::Sandbox::new("deno", std::time::Duration::from_secs(10)).available() {
         eprintln!("skipping: deno not on PATH");
         return;
     }
@@ -379,7 +379,7 @@ fn handler_scheme_grounds_with_locator_projection() {
         store.config().to_toml()
     );
     std::fs::write(root.join("ken.toml"), cfg).unwrap();
-    let store = KenStore::open(&root).unwrap();
+    let store = JishukenStore::open(&root).unwrap();
 
     ingest(&store, "auth.handler", "src/auth.rs", Volatility::Days);
     let g = ground_via_config(
@@ -401,7 +401,7 @@ fn handler_scheme_grounds_with_locator_projection() {
 }
 
 /// Run the ken binary against a store and return stdout, asserting success.
-fn ken_cli(store: &KenStore, args: &[&str]) -> String {
+fn ken_cli(store: &JishukenStore, args: &[&str]) -> String {
     let mut full = vec!["--store", store.root().to_str().unwrap()];
     full.extend_from_slice(args);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))

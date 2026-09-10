@@ -11,8 +11,8 @@
 //! a data-plane caller cannot mint the authorization token:
 //!
 //! ```compile_fail
-//! use ken::schema::{FactId, Outcome};
-//! use ken::write::WriteOp;
+//! use jishuken::schema::{FactId, Outcome};
+//! use jishuken::write::WriteOp;
 //! // error: cannot construct GroundCheck; field `_auth` (ControlToken) is private
 //! let _ = WriteOp::GroundCheck {
 //!     fact: FactId("x".into()),

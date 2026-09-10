@@ -19,9 +19,9 @@ Keep the store small enough that its contents are worth checking.
 Build and install from a checkout:
 
 ```sh
-git clone https://github.com/mattt/ken.git
-cd ken
-cargo install --path ken
+git clone https://github.com/mattt/jishuken.git
+cd jishuken
+cargo install --path jishuken
 ```
 
 The repository pins its Rust toolchain in `rust-toolchain.toml`.
@@ -378,7 +378,7 @@ Writes use a store lock; operate the store with a single writer.
 `undo` restores the last record's saved bytes and removes that record.
 It is the operation that rewrites history.
 
-The Rust library exposes `KenStore` for embedding,
+The Rust library exposes `JishukenStore` for embedding,
 with reads, `apply(WriteOp)`, conflict inspection, log access, and undo.
 Control-plane operations require a token constructed in `verify`.
 Library callers are trusted:
@@ -437,7 +437,7 @@ Budget settings and trust-weighted ranking do not supply those protections.
 
 ## Development
 
-The crate is in `ken/src/`; end-to-end tests are in `ken/tests/e2e.rs`.
+The crate is in `jishuken/src/`; end-to-end tests are in `jishuken/tests/e2e.rs`.
 Run the repository checks with:
 
 ```sh

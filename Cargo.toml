@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["ken"]
+members = ["jishuken"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/mattt/ken"
+repository = "https://github.com/mattt/jishuken"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

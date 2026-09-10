@@ -1,7 +1,7 @@
 //! `ken mcp`: a data-plane-only MCP server over stdio, built on the official
 //! `rmcp` SDK. Agents ingest and recall; they cannot verify, override, or grant,
 //! because the interface boundary is the trust boundary. This module never
-//! imports `ken::verify::authority`, so no control-plane op is reachable here.
+//! imports `jishuken::verify::authority`, so no control-plane op is reachable here.
 //!
 //! The surface is shaped to MCP conventions, not just RPC: tools carry
 //! read-only/idempotent annotations, reads are also addressable as resources
@@ -12,16 +12,16 @@
 
 use std::path::PathBuf;
 
-use ken::decay::{decayed_confidence, half_life_secs};
-use ken::ground::locator::parse_source;
-use ken::ground::{ground_source_for, render_ground};
-use ken::predicate::Predicate;
-use ken::scheduler;
-use ken::schema::{
+use jishuken::decay::{decayed_confidence, half_life_secs};
+use jishuken::ground::locator::parse_source;
+use jishuken::ground::{ground_source_for, render_ground};
+use jishuken::predicate::Predicate;
+use jishuken::scheduler;
+use jishuken::schema::{
     Claim, Fact, FactValue, GroundBinding, Groundedness, Outcome, TriageSource, Volatility,
 };
-use ken::store::KenStore;
-use ken::write::WriteOp;
+use jishuken::store::JishukenStore;
+use jishuken::write::WriteOp;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
     AnnotateAble, CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, Content,
@@ -69,7 +69,7 @@ grounds disagree (and facts with a refuted ground not yet in full conflict), and
 `ken://stale` ranks the facts most worth re-checking.";
 
 #[derive(Clone)]
-pub struct KenServer {
+pub struct JishukenServer {
     store_path: PathBuf,
 }
 
@@ -155,7 +155,7 @@ struct GroundOut {
 }
 
 #[tool_router]
-impl KenServer {
+impl JishukenServer {
     #[tool(
         description = "Recall a fact: its value plus the full epistemics (confidence and groundedness) that decide whether to trust it.",
         annotations(
@@ -320,19 +320,19 @@ impl KenServer {
     }
 }
 
-impl KenServer {
-    fn open(&self) -> Result<KenStore, String> {
-        KenStore::open(&self.store_path).map_err(|e| format!("store: {e}"))
+impl JishukenServer {
+    fn open(&self) -> Result<JishukenStore, String> {
+        JishukenStore::open(&self.store_path).map_err(|e| format!("store: {e}"))
     }
 
-    fn open_data(&self) -> Result<KenStore, ErrorData> {
+    fn open_data(&self) -> Result<JishukenStore, ErrorData> {
         self.open().map_err(|e| ErrorData::internal_error(e, None))
     }
 }
 
 // --- shared read helpers, used by both tools and resources ---
 
-fn recall_output(store: &KenStore, key: &str) -> Result<RecallOutput, String> {
+fn recall_output(store: &JishukenStore, key: &str) -> Result<RecallOutput, String> {
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let conf = decayed_confidence(&fact, now, store.config());
@@ -350,7 +350,7 @@ fn recall_output(store: &KenStore, key: &str) -> Result<RecallOutput, String> {
     })
 }
 
-fn conflicts_value(store: &KenStore) -> Result<Value, String> {
+fn conflicts_value(store: &JishukenStore) -> Result<Value, String> {
     let ids = store.list_conflicts().map_err(|e| e.to_string())?;
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let mut conflicts = Vec::new();
@@ -388,7 +388,7 @@ fn conflicts_value(store: &KenStore) -> Result<Value, String> {
 /// and consequential.
 /// A read-only window onto what the scheduler would check next, so an agent can
 /// distrust the memories that are due.
-fn stale_value(store: &KenStore) -> Result<Value, String> {
+fn stale_value(store: &JishukenStore) -> Result<Value, String> {
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let costs = store.cost_table();
@@ -410,7 +410,7 @@ fn stale_value(store: &KenStore) -> Result<Value, String> {
 
 /// Provenance back to the ground sources (the `ken why` answer, as JSON): where
 /// the fact came from, the ground checks against it, and whether they disagree.
-fn why_value(store: &KenStore, key: &str) -> Result<Value, String> {
+fn why_value(store: &JishukenStore, key: &str) -> Result<Value, String> {
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
     let mut ops = store.op_log(None).map_err(|e| e.to_string())?;
     ops.reverse();
@@ -526,7 +526,7 @@ fn key_overlap(candidate_key: &str, query: &str) -> usize {
 }
 
 /// The existing keys most similar to `query`, by token overlap, best first.
-fn nearest_keys(store: &KenStore, query: &str, limit: usize) -> Vec<String> {
+fn nearest_keys(store: &JishukenStore, query: &str, limit: usize) -> Vec<String> {
     let Ok(facts) = store.all_facts() else {
         return Vec::new();
     };
@@ -542,7 +542,7 @@ fn nearest_keys(store: &KenStore, query: &str, limit: usize) -> Vec<String> {
 
 /// Turn a bare recall failure into an actionable message: name the likely
 /// mistake and point at `ken_search`, with the closest existing keys.
-fn recall_hint(store: &KenStore, key: &str, err: &str) -> String {
+fn recall_hint(store: &JishukenStore, key: &str, err: &str) -> String {
     use std::fmt::Write as _;
     let mut msg = format!("{err}. ");
     if !key.contains('.') {
@@ -633,7 +633,7 @@ fn prompt_messages(
 
 // --- completion: suggest the keys actually in the store ---
 
-fn completion_values(store: &KenStore, arg_name: &str, partial: &str) -> Vec<String> {
+fn completion_values(store: &JishukenStore, arg_name: &str, partial: &str) -> Vec<String> {
     let Ok(facts) = store.all_facts() else {
         return Vec::new();
     };
@@ -652,7 +652,7 @@ fn completion_values(store: &KenStore, arg_name: &str, partial: &str) -> Vec<Str
 }
 
 #[tool_handler]
-impl ServerHandler for KenServer {
+impl ServerHandler for JishukenServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -805,7 +805,7 @@ pub fn serve(store_path: PathBuf) -> anyhow::Result<()> {
         .enable_time()
         .build()?;
     runtime.block_on(async move {
-        let service = KenServer { store_path }.serve(stdio()).await?;
+        let service = JishukenServer { store_path }.serve(stdio()).await?;
         service.waiting().await?;
         anyhow::Ok(())
     })
@@ -814,8 +814,8 @@ pub fn serve(store_path: PathBuf) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{hit_score, key_overlap, query_tokens};
-    use super::{IngestParams, KenServer, RecallParams, SearchParams};
-    use ken::store::KenStore;
+    use super::{IngestParams, JishukenServer, RecallParams, SearchParams};
+    use jishuken::store::JishukenStore;
     use rmcp::handler::server::wrapper::Parameters;
 
     fn ingest_params(key: &str, value: &str) -> IngestParams {
@@ -831,14 +831,14 @@ mod tests {
     /// Drive the served tool surface end to end against a real store:
     /// ingest -> tokenized search -> recall (hit and actionable miss) ->
     /// conflicts with the `distrusted` section. Control-plane fixture state is
-    /// created through `ken::engine` (the same path the CLI uses); the served
+    /// created through `jishuken::engine` (the same path the CLI uses); the served
     /// surface itself stays data-plane only.
     #[test]
     fn tool_surface_roundtrip_against_real_store() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".ken");
-        let store = KenStore::init(&root).unwrap();
-        let server = KenServer {
+        let store = JishukenStore::init(&root).unwrap();
+        let server = JishukenServer {
             store_path: root.clone(),
         };
 
@@ -964,15 +964,15 @@ mod tests {
         );
     }
 
-    fn ground(store: &KenStore, key: &str, source: &str) {
-        let (src, locator) = ken::ground::locator::parse_source(source, None).unwrap();
-        let binding = ken::schema::GroundBinding {
-            source: ken::schema::GroundSource::File(src),
+    fn ground(store: &JishukenStore, key: &str, source: &str) {
+        let (src, locator) = jishuken::ground::locator::parse_source(source, None).unwrap();
+        let binding = jishuken::schema::GroundBinding {
+            source: jishuken::schema::GroundSource::File(src),
             locator,
-            predicate: ken::predicate::Predicate::Exists,
+            predicate: jishuken::predicate::Predicate::Exists,
             last: None,
         };
-        ken::engine::ground(store, key, binding).unwrap();
+        jishuken::engine::ground(store, key, binding).unwrap();
     }
 
     #[test]

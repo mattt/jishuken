@@ -11,19 +11,19 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 
-use ken::calibration::{brier_score, recalibrate, reliability_bins};
-use ken::decay::{decayed_confidence, half_life_secs};
-use ken::engine;
-use ken::ground::locator::parse_source;
-use ken::predicate::Predicate;
-use ken::scheduler;
-use ken::schema::{
+use jishuken::calibration::{brier_score, recalibrate, reliability_bins};
+use jishuken::decay::{decayed_confidence, half_life_secs};
+use jishuken::engine;
+use jishuken::ground::locator::parse_source;
+use jishuken::predicate::Predicate;
+use jishuken::scheduler;
+use jishuken::schema::{
     Claim, CommandSource, Element, Epistemics, Fact, FactValue, GroundBinding, GroundSource,
     Groundedness, Locator, SourceRef, SourceRoot, TriageSource, Volatility,
 };
-use ken::store::KenStore;
-use ken::verify::authority;
-use ken::write::WriteOp;
+use jishuken::store::JishukenStore;
+use jishuken::verify::authority;
+use jishuken::write::WriteOp;
 
 #[derive(Parser)]
 #[command(name = "ken", version, about = "Self-verifying memory for agents.")]
@@ -205,7 +205,7 @@ fn run() -> anyhow::Result<()> {
             Some(p) => p.clone(),
             None => std::env::current_dir()?.join(".ken"),
         };
-        let store = KenStore::init(&target)?;
+        let store = JishukenStore::init(&target)?;
         println!("initialized ken store at {}", store.root().display());
         return Ok(());
     }
@@ -267,7 +267,7 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_calibration(store: &KenStore, bins: usize, json: bool) -> anyhow::Result<()> {
+fn cmd_calibration(store: &JishukenStore, bins: usize, json: bool) -> anyhow::Result<()> {
     let samples = store.calibration_samples()?;
     let brier = brier_score(&samples);
     let reliability = reliability_bins(&samples, bins);
@@ -304,13 +304,13 @@ fn cmd_calibration(store: &KenStore, bins: usize, json: bool) -> anyhow::Result<
     Ok(())
 }
 
-fn open_store(cli: &Cli) -> anyhow::Result<KenStore> {
+fn open_store(cli: &Cli) -> anyhow::Result<JishukenStore> {
     let cwd = std::env::current_dir()?;
-    Ok(KenStore::discover(cli.store.as_deref(), &cwd)?)
+    Ok(JishukenStore::discover(cli.store.as_deref(), &cwd)?)
 }
 
 fn cmd_add(
-    store: &KenStore,
+    store: &JishukenStore,
     AddArgs {
         key,
         value,
@@ -380,8 +380,8 @@ fn cmd_add(
 
 /// Turn a parsed source reference into a ground source (handler-backed scheme
 /// or plain file), capturing any handler's content hash now.
-fn source_to_ground(store: &KenStore, src: SourceRef) -> anyhow::Result<GroundSource> {
-    Ok(ken::ground::ground_source_for(
+fn source_to_ground(store: &JishukenStore, src: SourceRef) -> anyhow::Result<GroundSource> {
+    Ok(jishuken::ground::ground_source_for(
         store.config(),
         store.root(),
         src,
@@ -389,7 +389,7 @@ fn source_to_ground(store: &KenStore, src: SourceRef) -> anyhow::Result<GroundSo
 }
 
 fn cmd_ground(
-    store: &KenStore,
+    store: &JishukenStore,
     GroundArgs {
         key,
         source,
@@ -419,8 +419,8 @@ fn cmd_ground(
             )
         }
         (None, None, Some(path)) => {
-            let caps = ken::schema::Capabilities::default(); // network-free until granted
-            let src = ken::ground::generator::GeneratorRegistry::load_src(&path, caps)?;
+            let caps = jishuken::schema::Capabilities::default(); // network-free until granted
+            let src = jishuken::ground::generator::GeneratorRegistry::load_src(&path, caps)?;
             let r = store.registry().put(&src)?;
             (GroundSource::Generator(r), Locator::Whole)
         }
@@ -437,7 +437,7 @@ fn cmd_ground(
     Ok(())
 }
 
-fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()> {
     let fact = store.read_fact_by_key(key)?;
     let now = Utc::now();
     let conf = decayed_confidence(&fact, now, store.config());
@@ -476,7 +476,7 @@ fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
             println!(
                 "  grounded     verified {} · {}",
                 relative(*at, now),
-                latest_ground(&fact, ken::schema::Outcome::Confirmed)
+                latest_ground(&fact, jishuken::schema::Outcome::Confirmed)
                     .unwrap_or_else(|| "existence".to_string())
             );
         }
@@ -484,7 +484,7 @@ fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
             println!(
                 "  grounded     refuted {} · {}",
                 relative(*at, now),
-                latest_ground(&fact, ken::schema::Outcome::Refuted)
+                latest_ground(&fact, jishuken::schema::Outcome::Refuted)
                     .unwrap_or_else(|| "existence".to_string())
             );
         }
@@ -499,14 +499,14 @@ fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_why(store: &KenStore, key: &str) -> anyhow::Result<()> {
+fn cmd_why(store: &JishukenStore, key: &str) -> anyhow::Result<()> {
     let fact = store.read_fact_by_key(key)?;
     println!("{key} = {}", fact.value.render());
     println!(
         "  ingested   {} by {}  (confidence {:.2}, ungrounded)",
         fact.provenance.ingested_at.format("%Y-%m-%d"),
         fact.provenance.ingested_by,
-        ken::write::landed_confidence(&TriageSource::Ingest).min(fact.epistemics.confidence),
+        jishuken::write::landed_confidence(&TriageSource::Ingest).min(fact.epistemics.confidence),
     );
 
     // Ground-check operations for this fact, oldest first (tagged op log).
@@ -548,7 +548,7 @@ fn cmd_why(store: &KenStore, key: &str) -> anyhow::Result<()> {
         println!(
             "  ground     {}  {}  [{}]{}",
             g.source.kind_label(),
-            ken::ground::render_ground(g),
+            jishuken::ground::render_ground(g),
             g.predicate.label(),
             span
         );
@@ -561,7 +561,7 @@ fn cmd_why(store: &KenStore, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_stale(store: &KenStore, limit: usize) -> anyhow::Result<()> {
+fn cmd_stale(store: &JishukenStore, limit: usize) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
     let costs = store.cost_table();
@@ -585,7 +585,7 @@ fn cmd_stale(store: &KenStore, limit: usize) -> anyhow::Result<()> {
 }
 
 fn cmd_search(
-    store: &KenStore,
+    store: &JishukenStore,
     SearchArgs {
         query,
         entity,
@@ -664,7 +664,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_conflicts(store: &KenStore) -> anyhow::Result<()> {
+fn cmd_conflicts(store: &JishukenStore) -> anyhow::Result<()> {
     let ids = store.list_conflicts()?;
     if ids.is_empty() {
         println!("no conflicts");
@@ -678,7 +678,7 @@ fn cmd_conflicts(store: &KenStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_log(store: &KenStore) -> anyhow::Result<()> {
+fn cmd_log(store: &JishukenStore) -> anyhow::Result<()> {
     for op in store.op_log(None)? {
         println!("{}  {}  {}", short_op(&op.id), op.time, op.description);
     }
@@ -686,7 +686,7 @@ fn cmd_log(store: &KenStore) -> anyhow::Result<()> {
 }
 
 fn cmd_doubt(
-    store: &KenStore,
+    store: &JishukenStore,
     key: &str,
     reason: String,
     confidence: Option<f64>,
@@ -704,7 +704,7 @@ fn cmd_doubt(
     Ok(())
 }
 
-fn cmd_tick(store: &KenStore) -> anyhow::Result<()> {
+fn cmd_tick(store: &JishukenStore) -> anyhow::Result<()> {
     let results = engine::tick(store)?;
     if results.is_empty() {
         println!("nothing due");
@@ -717,7 +717,7 @@ fn cmd_tick(store: &KenStore) -> anyhow::Result<()> {
 }
 
 fn cmd_serve(
-    store: &KenStore,
+    store: &JishukenStore,
     interval: Option<String>,
     once: bool,
     install: bool,
@@ -753,7 +753,7 @@ fn cmd_serve(
 
     let secs = interval
         .as_deref()
-        .and_then(ken::config::parse_duration_secs)
+        .and_then(jishuken::config::parse_duration_secs)
         .unwrap_or_else(|| store.config().daemon.interval_secs());
 
     loop {
@@ -917,7 +917,7 @@ fn grounds_json(fact: &Fact) -> serde_json::Value {
         .iter()
         .map(|g| {
             serde_json::json!({
-                "source": ken::ground::render_ground(g),
+                "source": jishuken::ground::render_ground(g),
                 "kind": g.source.kind_label(),
                 "predicate": g.predicate.label(),
                 "last": g.last.as_ref().map(|r| serde_json::json!({
@@ -933,7 +933,7 @@ fn grounds_json(fact: &Fact) -> serde_json::Value {
 }
 
 /// The latest ground with the requested outcome, for the recall line.
-fn latest_ground(fact: &Fact, outcome: ken::schema::Outcome) -> Option<String> {
+fn latest_ground(fact: &Fact, outcome: jishuken::schema::Outcome) -> Option<String> {
     fact.grounds
         .iter()
         .filter(|g| g.last.as_ref().is_some_and(|r| r.outcome == outcome))
@@ -944,7 +944,7 @@ fn latest_ground(fact: &Fact, outcome: ken::schema::Outcome) -> Option<String> {
                 .at
                 .cmp(&b.last.as_ref().unwrap().at)
         })
-        .map(ken::ground::render_ground)
+        .map(jishuken::ground::render_ground)
 }
 
 fn volatility_label(v: Volatility) -> &'static str {
@@ -956,12 +956,12 @@ fn volatility_label(v: Volatility) -> &'static str {
     }
 }
 
-fn due_at(fact: &Fact, store: &KenStore) -> Option<DateTime<Utc>> {
+fn due_at(fact: &Fact, store: &JishukenStore) -> Option<DateTime<Utc>> {
     let hl = half_life_secs(fact.schedule.volatility, store.config())?;
     Some(fact.schedule.last_verified + chrono::Duration::seconds(hl as i64))
 }
 
-fn is_due(fact: &Fact, store: &KenStore, now: DateTime<Utc>) -> bool {
+fn is_due(fact: &Fact, store: &JishukenStore, now: DateTime<Utc>) -> bool {
     due_at(fact, store).is_some_and(|d| d <= now)
 }
 

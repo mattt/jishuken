@@ -1,5 +1,5 @@
 [package]
-name = "ken"
+name = "jishuken"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,8 @@ repository.workspace = true
 description = "Jishuken: self-verifying memory for agents, backed by fact files and an op log."
 authors = ["Mattt Zmuda <mattt@me.com>"]
 readme = "../README.md"
-homepage = "https://github.com/mattt/ken"
-documentation = "https://docs.rs/ken"
+homepage = "https://github.com/mattt/jishuken"
+documentation = "https://docs.rs/jishuken"
 keywords = ["agents", "memory", "mcp", "verification", "provenance"]
 categories = ["command-line-utilities", "development-tools", "caching"]
 # The readme above is pulled in from the workspace root by cargo; include
@@ -16,7 +16,7 @@ categories = ["command-line-utilities", "development-tools", "caching"]
 include = ["src/**/*.rs", "LICENSE"]
 
 [lib]
-name = "ken"
+name = "jishuken"
 path = "src/lib.rs"
 
 [[bin]]

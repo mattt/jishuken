@@ -73,28 +73,28 @@ struct OpRecord {
 }
 
 #[derive(Debug)]
-pub struct KenStore {
+pub struct JishukenStore {
     root: PathBuf,
     config: Config,
     /// Changes accumulated by the in-flight op, drained when it is committed.
     pending: Mutex<Vec<Change>>,
 }
 
-impl KenStore {
+impl JishukenStore {
     /// Discover the store by walking up from `start` for a `.ken/` directory,
     /// the way `git` finds `.git/`. Honors an explicit override first.
     ///
     /// # Errors
     /// Returns [`Error::StoreNotFound`] if no `.ken/` store is found.
-    pub fn discover(explicit: Option<&Path>, start: &Path) -> Result<KenStore> {
+    pub fn discover(explicit: Option<&Path>, start: &Path) -> Result<JishukenStore> {
         if let Some(p) = explicit {
-            return KenStore::open(p);
+            return JishukenStore::open(p);
         }
         let mut dir = Some(start);
         while let Some(d) = dir {
             let candidate = d.join(".ken");
             if candidate.join("ken.toml").is_file() {
-                return KenStore::open(&candidate);
+                return JishukenStore::open(&candidate);
             }
             dir = d.parent();
         }
@@ -106,12 +106,12 @@ impl KenStore {
     /// # Errors
     /// Returns [`Error::StoreNotFound`] if `root` is not a `ken` store (no
     /// `ken.toml`).
-    pub fn open(root: &Path) -> Result<KenStore> {
+    pub fn open(root: &Path) -> Result<JishukenStore> {
         if !root.join("ken.toml").is_file() {
             return Err(Error::StoreNotFound);
         }
         let config = Config::load_or_default(&root.join("ken.toml"));
-        Ok(KenStore {
+        Ok(JishukenStore {
             root: root.to_path_buf(),
             config,
             pending: Mutex::new(Vec::new()),
@@ -135,13 +135,13 @@ impl KenStore {
     ///
     /// # Errors
     /// Returns an error if the directories or files cannot be created.
-    pub fn init(root: &Path) -> Result<KenStore> {
+    pub fn init(root: &Path) -> Result<JishukenStore> {
         std::fs::create_dir_all(root)?;
         std::fs::create_dir_all(root.join("facts"))?;
         std::fs::create_dir_all(root.join("verifiers"))?;
         let cfg = Config::default();
         std::fs::write(root.join("ken.toml"), cfg.to_toml())?;
-        let store = KenStore::open(root)?;
+        let store = JishukenStore::open(root)?;
         {
             let _lock = store.lock()?;
             store.append_op("Init", "ken store")?;
@@ -224,7 +224,7 @@ impl KenStore {
     }
 
     /// Persist a fact file, recording it on the in-flight op. Control-plane
-    /// callers use this alongside [`KenStore::control_commit`] to land one
+    /// callers use this alongside [`JishukenStore::control_commit`] to land one
     /// tagged op.
     ///
     /// # Errors
@@ -738,7 +738,7 @@ fn whoami() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_groundedness, KenStore, OpId};
+    use super::{aggregate_groundedness, JishukenStore, OpId};
     use crate::ground::locator::parse_source;
     use crate::predicate::Predicate;
     use crate::schema::{
@@ -755,7 +755,7 @@ mod tests {
         }
     }
 
-    fn ingest(store: &KenStore, key: &str) {
+    fn ingest(store: &JishukenStore, key: &str) {
         let claim = Claim::parse_key(key).unwrap();
         store
             .apply(WriteOp::ingest(
@@ -771,7 +771,7 @@ mod tests {
     #[test]
     fn ingest_appends_a_tagged_op_and_undo_reverts_it() {
         let dir = tempfile::tempdir().unwrap();
-        let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+        let store = JishukenStore::init(&dir.path().join(".ken")).unwrap();
 
         ingest(&store, "db.host");
         assert!(store.read_fact_by_key("db.host").is_ok());
@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn op_log_since_keeps_only_newer_records() {
         let dir = tempfile::tempdir().unwrap();
-        let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+        let store = JishukenStore::init(&dir.path().join(".ken")).unwrap();
 
         ingest(&store, "x.one");
         let marker = store.op_log(None).unwrap().first().unwrap().id.clone();
