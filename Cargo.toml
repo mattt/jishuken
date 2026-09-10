@@ -49,7 +49,7 @@ unused_result_ok = "warn"
 # Project opt-outs: pedantic lints whose churn outweighs their value here.
 # Getters/labels are not an API-misuse risk in a binary-plus-library.
 must_use_candidate = "allow"
-# Whole-second and duration arithmetic; sub-second precision is irrelevant.
+# Confidence and scheduling calculations convert elapsed time to f64.
 cast_precision_loss = "allow"
 cast_possible_truncation = "allow"
 # Tests assert on exactly-representable f64 constants.

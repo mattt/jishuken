@@ -45,8 +45,8 @@ fn min_check_cost(f: &Fact, costs: &CostTable) -> Option<f64> {
 /// `voi = p_wrong * centrality / cost`.
 /// Cost is the cheapest ground check (tier-1/2 are cheap, tier-3 carries the
 /// measured or estimated cost).
-pub fn voi_score(f: &Fact, now: Timestamp, cfg: &Config, costs: &CostTable) -> f64 {
-    let p_wrong = 1.0 - decayed_confidence(f, now, cfg);
+pub fn voi_score(f: &Fact, now: Timestamp, costs: &CostTable) -> f64 {
+    let p_wrong = 1.0 - decayed_confidence(f, now);
     let consequence = f.schedule.centrality;
     let cost = min_check_cost(f, costs).map_or(NO_GROUND_COST, |c| c.max(1e-6));
     p_wrong * consequence / cost
@@ -118,15 +118,10 @@ pub fn select_audits<'a>(
 }
 
 /// Facts ranked by descending `VoI`.
-pub fn rank<'a>(
-    facts: &'a [Fact],
-    now: Timestamp,
-    cfg: &Config,
-    costs: &CostTable,
-) -> Vec<&'a Fact> {
+pub fn rank<'a>(facts: &'a [Fact], now: Timestamp, costs: &CostTable) -> Vec<&'a Fact> {
     let mut scored: Vec<(&Fact, f64)> = facts
         .iter()
-        .map(|f| (f, voi_score(f, now, cfg, costs)))
+        .map(|f| (f, voi_score(f, now, costs)))
         .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.into_iter().map(|(f, _)| f).collect()
@@ -140,7 +135,7 @@ pub fn select_tick<'a>(
     cfg: &Config,
     costs: &CostTable,
 ) -> Vec<&'a Fact> {
-    rank(facts, now, cfg, costs)
+    rank(facts, now, costs)
         .into_iter()
         .filter(|f| f.is_checkable())
         .take(cfg.budget.per_tick)
@@ -187,38 +182,35 @@ mod tests {
 
     #[test]
     fn wrong_and_consequential_ranks_first() {
-        let cfg = Config::default();
         let now = Utc::now();
         let costs = CostTable::new();
         let likely_wrong_central = fact("a.x", 0.1, 10.0, 1.0);
         let confident_central = fact("b.x", 0.99, 10.0, 1.0);
         let wrong_trivial = fact("c.x", 0.1, 0.1, 1.0);
         let facts = vec![confident_central, wrong_trivial, likely_wrong_central];
-        let ranked = rank(&facts, now, &cfg, &costs);
+        let ranked = rank(&facts, now, &costs);
         assert_eq!(ranked[0].claim.key(), "a.x");
     }
 
     #[test]
     fn cost_lowers_priority() {
-        let cfg = Config::default();
         let now = Utc::now();
         let costs = CostTable::new();
         let cheap = fact("cheap.x", 0.2, 5.0, 1.0);
         let pricey = fact("pricey.x", 0.2, 5.0, 50.0);
-        assert!(voi_score(&cheap, now, &cfg, &costs) > voi_score(&pricey, now, &cfg, &costs));
+        assert!(voi_score(&cheap, now, &costs) > voi_score(&pricey, now, &costs));
     }
 
     #[test]
     fn measured_cost_overrides_static_estimate() {
-        let cfg = Config::default();
         let now = Utc::now();
         // Both facts share generator hash "h" with a cheap static estimate; the
         // measured median makes checking it expensive, dropping its VoI.
         let f = fact("a.x", 0.2, 5.0, 1.0);
-        let cheap = voi_score(&f, now, &cfg, &CostTable::new());
+        let cheap = voi_score(&f, now, &CostTable::new());
         let mut costs = CostTable::new();
         costs.insert(GeneratorHash("h".into()), 100.0);
-        let measured = voi_score(&f, now, &cfg, &costs);
+        let measured = voi_score(&f, now, &costs);
         assert!(measured < cheap, "measured {measured} should be < {cheap}");
     }
 

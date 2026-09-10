@@ -5,8 +5,8 @@ use jishuken::engine;
 use jishuken::ground::locator::parse_source;
 use jishuken::predicate::Predicate;
 use jishuken::schema::{
-    Claim, CommandSource, FactValue, GroundBinding, GroundSource, Groundedness, SourceRoot,
-    TriageSource, Volatility,
+    Claim, CommandSource, FactValue, GroundBinding, GroundSource, Groundedness, HalfLife,
+    SourceRoot, TriageSource,
 };
 use jishuken::store::{JishukenStore, OpId};
 use jishuken::write::{WriteOp, INGEST_CONFIDENCE_CEILING};
@@ -52,7 +52,7 @@ fn ingest(
     store: &JishukenStore,
     key: &str,
     value: &str,
-    vol: Volatility,
+    vol: HalfLife,
 ) -> jishuken::schema::FactId {
     let claim = Claim::parse_key(key).unwrap();
     store
@@ -77,7 +77,7 @@ fn init_add_recall_roundtrip() {
         &store,
         "staging.url",
         "https://stg.example.com",
-        Volatility::Hours,
+        "PT6H".parse::<HalfLife>().unwrap(),
     );
 
     let fact = store.read_fact_by_key("staging.url").unwrap();
@@ -94,7 +94,12 @@ fn init_add_recall_roundtrip() {
 #[test]
 fn ingest_is_one_tagged_op_in_the_log() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "db.host", "10.0.0.1", Volatility::Slow);
+    ingest(
+        &store,
+        "db.host",
+        "10.0.0.1",
+        "P90D".parse::<HalfLife>().unwrap(),
+    );
     let ops = store.op_log(None).unwrap();
     assert!(
         ops.iter()
@@ -106,7 +111,7 @@ fn ingest_is_one_tagged_op_in_the_log() {
 #[test]
 fn recall_reads_the_ingested_fact_file() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "svc.port", "8080", Volatility::Days);
+    ingest(&store, "svc.port", "8080", HalfLife::default());
     let fact = store.read_fact_by_key("svc.port").unwrap();
     assert_eq!(fact.value.render(), "8080");
 }
@@ -115,7 +120,7 @@ fn recall_reads_the_ingested_fact_file() {
 fn undo_rolls_back_one_operation() {
     let (_dir, store) = fresh_store();
     for value in ["A", "B", "C"] {
-        ingest(&store, "a.b", value, Volatility::Days);
+        ingest(&store, "a.b", value, HalfLife::default());
     }
     assert_eq!(store.op_log(None).unwrap().len(), 4);
     store.undo().unwrap();
@@ -123,7 +128,7 @@ fn undo_rolls_back_one_operation() {
     store.undo().unwrap();
     assert_eq!(store.read_fact_by_key("a.b").unwrap().value.render(), "A");
     assert_eq!(store.op_log(None).unwrap().len(), 2);
-    ingest(&store, "a.b", "D", Volatility::Days);
+    ingest(&store, "a.b", "D", HalfLife::default());
     store.undo().unwrap();
     assert_eq!(store.read_fact_by_key("a.b").unwrap().value.render(), "A");
     store.undo().unwrap();
@@ -138,7 +143,7 @@ fn undo_rolls_back_one_operation() {
 #[test]
 fn undo_restores_verification_calibration_and_centrality_together() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "release.owner", "alice", Volatility::Days);
+    ingest(&store, "release.owner", "alice", HalfLife::default());
     std::fs::write(store.root().join("owner.txt"), "alice").unwrap();
     ground_file(&store, "release.owner", "store:owner.txt", "equals");
     let before = store.read_fact_by_key("release.owner").unwrap();
@@ -247,10 +252,10 @@ fn discovery_walks_up_for_dot_ken() {
 #[test]
 fn op_log_since_truncates() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "x.one", "1", Volatility::Days);
+    ingest(&store, "x.one", "1", HalfLife::default());
     let mid = store.op_log(None).unwrap();
     let marker = mid.first().unwrap().id.clone();
-    ingest(&store, "x.two", "2", Volatility::Days);
+    ingest(&store, "x.two", "2", HalfLife::default());
     let since = store.op_log(Some(OpId(marker))).unwrap();
     // Everything up to (not including) the marker: only the newer ops remain.
     assert!(since.iter().all(|o| !o.description.contains("x.one")));
@@ -262,7 +267,7 @@ fn op_log_since_truncates() {
 fn tier1_existence_grounds_and_reconfirms() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("data.txt"), "hello world").unwrap();
-    ingest(&store, "doc.greeting", "hello", Volatility::Days);
+    ingest(&store, "doc.greeting", "hello", HalfLife::default());
 
     let g = ground_file(
         &store,
@@ -286,7 +291,12 @@ fn tier1_existence_grounds_and_reconfirms() {
 fn two_independent_grounds_disagree_conflict() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("src.txt"), "auth lives here").unwrap();
-    ingest(&store, "auth.handler", "auth lives here", Volatility::Days);
+    ingest(
+        &store,
+        "auth.handler",
+        "auth lives here",
+        HalfLife::default(),
+    );
 
     // Ground A resolves (the quote is present) -> Confirmed.
     ground_file(
@@ -325,7 +335,7 @@ fn tick_checks_grounded_facts() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     for key in ["thing.exists", "other.exists", "third.exists"] {
-        ingest(&store, key, "present", Volatility::Hours);
+        ingest(&store, key, "present", "PT6H".parse::<HalfLife>().unwrap());
         ground_file(&store, key, "store:d.txt?q=\"present\"", "exists");
     }
 
@@ -361,7 +371,7 @@ fn concurrent_tick_checks_all_and_coalesces_centrality() {
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     let keys = ["a.exists", "b.exists", "c.exists", "d.exists"];
     for key in keys {
-        ingest(&store, key, "present", Volatility::Hours);
+        ingest(&store, key, "present", "PT6H".parse::<HalfLife>().unwrap());
         ground_file(&store, key, "store:d.txt?q=\"present\"", "exists");
     }
 
@@ -393,7 +403,12 @@ fn audit_through_independent_ground_flips_to_conflicted() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("a.txt"), "auth lives here").unwrap();
     std::fs::write(store.root().join("b.txt"), "auth lives here").unwrap();
-    ingest(&store, "auth.handler", "auth lives here", Volatility::Days);
+    ingest(
+        &store,
+        "auth.handler",
+        "auth lives here",
+        HalfLife::default(),
+    );
 
     // Two independent grounds, both confirming -> Verified.
     ground_file(
@@ -428,13 +443,13 @@ fn audit_through_independent_ground_flips_to_conflicted() {
 fn predicate_contains_judges_span() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("cfg.txt"), "port = 8080\nhost = local").unwrap();
-    ingest(&store, "svc.port", "8080", Volatility::Days);
+    ingest(&store, "svc.port", "8080", HalfLife::default());
     // The span (whole file) contains the claim "8080" -> Confirmed.
     let g = ground_file(&store, "svc.port", "store:cfg.txt", "contains");
     assert!(matches!(g, Groundedness::Verified { .. }));
 
     // A claim not present -> Refuted.
-    ingest(&store, "svc.other", "9999", Volatility::Days);
+    ingest(&store, "svc.other", "9999", HalfLife::default());
     let g = ground_file(&store, "svc.other", "store:cfg.txt", "contains");
     let f = store.read_fact_by_key("svc.other").unwrap();
     assert!(matches!(g, Groundedness::Refuted { .. }));
@@ -447,7 +462,12 @@ fn predicate_contains_judges_span() {
 #[test]
 fn command_allowlist_denies_unlisted_program() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "svc.health", "ok", Volatility::Hours);
+    ingest(
+        &store,
+        "svc.health",
+        "ok",
+        "PT6H".parse::<HalfLife>().unwrap(),
+    );
     // `[command] allow` is empty by default, so any command is denied.
     let binding = GroundBinding {
         source: GroundSource::Command(CommandSource {
@@ -493,7 +513,7 @@ fn handler_scheme_grounds_with_locator_projection() {
     std::fs::write(root.join("ken.toml"), cfg).unwrap();
     let store = JishukenStore::open(&root).unwrap();
 
-    ingest(&store, "auth.handler", "src/auth.rs", Volatility::Days);
+    ingest(&store, "auth.handler", "src/auth.rs", HalfLife::default());
     let g = ground_via_config(
         &store,
         "auth.handler",
@@ -535,7 +555,7 @@ fn cli_ground_verify_recall_roundtrip() {
     let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("cfg.txt"), "port = 8080").unwrap();
 
-    ken_cli(&store, &["add", "svc.port", "8080", "--volatility", "days"]);
+    ken_cli(&store, &["add", "svc.port", "8080", "--half-life", "3d"]);
     let out = ken_cli(
         &store,
         &[
@@ -603,7 +623,7 @@ fn cli_tick_checks_due_facts() {
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     ken_cli(
         &store,
-        &["add", "thing.exists", "present", "--volatility", "hours"],
+        &["add", "thing.exists", "present", "--half-life", "6h"],
     );
     ken_cli(
         &store,
@@ -666,8 +686,8 @@ fn cli_calibration_reports_accumulated_samples() {
 #[test]
 fn search_binary_lists_and_filters() {
     let (_dir, store) = fresh_store();
-    ingest(&store, "alpha.one", "v1", Volatility::Days);
-    ingest(&store, "beta.two", "v2", Volatility::Days);
+    ingest(&store, "alpha.one", "v1", HalfLife::default());
+    ingest(&store, "beta.two", "v2", HalfLife::default());
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
         .args([
@@ -702,4 +722,83 @@ fn search_binary_lists_and_filters() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).contains("no matches"));
+}
+
+#[test]
+fn cli_half_lives_use_durations_and_save_the_ingest_default() {
+    let (_dir, store) = fresh_store();
+    let mut config = store.config().clone();
+    config.decay.default_half_life = "2w".parse().unwrap();
+    std::fs::write(store.root().join("ken.toml"), config.to_toml()).unwrap();
+    ken_cli(&store, &["add", "default.duration", "present"]);
+    config.decay.default_half_life = "P1Y".parse().unwrap();
+    std::fs::write(store.root().join("ken.toml"), config.to_toml()).unwrap();
+    let recalled: serde_json::Value =
+        serde_json::from_str(&ken_cli(&store, &["recall", "default.duration", "--json"])).unwrap();
+    assert_eq!(recalled["half_life"], "P14D");
+    for (input, canonical) in [
+        ("P1M", "P1M"),
+        ("PT1M", "PT1M"),
+        ("1h30m", "PT1H30M"),
+        ("1 hour, 30 minutes", "PT1H30M"),
+        ("never", "never"),
+        ("1ns", "PT0.000000001S"),
+    ] {
+        ken_cli(
+            &store,
+            &["add", "explicit.duration", "present", "--half-life", input],
+        );
+        let recalled: serde_json::Value =
+            serde_json::from_str(&ken_cli(&store, &["recall", "explicit.duration", "--json"]))
+                .unwrap();
+        assert_eq!(recalled["half_life"], canonical);
+        assert_eq!(recalled["groundedness"]["state"], "ungrounded");
+        let fact = store.read_fact_by_key("explicit.duration").unwrap();
+        let expected_due = fact
+            .schedule
+            .half_life
+            .deadline(fact.schedule.last_verified);
+        assert_eq!(recalled["due"], serde_json::to_value(expected_due).unwrap());
+    }
+    let before = std::fs::read(store.root().join("ops.jsonl")).unwrap();
+    for input in ["PT0S", "NaN", "typo", "-P1D", "P1DT", "PT1.5H1M"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
+            .args([
+                "--store",
+                store.root().to_str().unwrap(),
+                "add",
+                "explicit.duration",
+                "must not replace",
+                "--half-life",
+                input,
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {input}");
+    }
+    assert_eq!(
+        std::fs::read(store.root().join("ops.jsonl")).unwrap(),
+        before
+    );
+    assert_eq!(
+        store
+            .read_fact_by_key("explicit.duration")
+            .unwrap()
+            .value
+            .render(),
+        "present"
+    );
+    ken_cli(&store, &["serve", "--once", "--interval", "PT0.5S"]);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
+        .args([
+            "--store",
+            store.root().to_str().unwrap(),
+            "serve",
+            "--once",
+            "--interval",
+            "typo",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
 }

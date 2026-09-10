@@ -3,12 +3,12 @@
 //! place the full [`Fact`] skeleton lives.
 
 use crate::schema::{
-    Claim, Epistemics, Fact, FactId, FactValue, GeneratorHash, Groundedness, Provenance,
-    ScheduleMeta, Volatility,
+    Claim, Epistemics, Fact, FactId, FactValue, GeneratorHash, Groundedness, HalfLife, Provenance,
+    ScheduleMeta,
 };
 use chrono::Utc;
 
-/// A freshly verified scalar fact with neutral schedule defaults: immutable,
+/// A freshly verified scalar fact with neutral schedule defaults: no decay,
 /// centrality `1.0`, verified just now, confidence `0.9`. Tests override the
 /// fields they exercise.
 pub(crate) fn verified_scalar(key: &str) -> Fact {
@@ -28,7 +28,7 @@ pub(crate) fn verified_scalar(key: &str) -> Fact {
             },
         },
         schedule: ScheduleMeta {
-            volatility: Volatility::Immutable,
+            half_life: HalfLife::Never,
             centrality: 1.0,
             last_verified: now,
             variance_at_verify: 0.05,

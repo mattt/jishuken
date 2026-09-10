@@ -6,15 +6,19 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::duration::{FixedDuration, HalfLife};
 use crate::error::{Error, Result};
-use crate::schema::{Capabilities, SourceRoot, Volatility};
+use crate::schema::{Capabilities, SourceRoot};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub budget: Budget,
     #[serde(default)]
-    pub volatility: VolatilityMap,
+    pub decay: Decay,
+    /// Read old class mappings when opening pre-release stores.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) volatility: BTreeMap<String, HalfLife>,
     #[serde(default)]
     pub sandbox: Sandbox,
     #[serde(default)]
@@ -99,20 +103,20 @@ impl SourceRootCfg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Daemon {
     /// Scheduler tick interval for `ken serve`.
-    pub interval: String,
+    pub interval: FixedDuration,
 }
 
 impl Default for Daemon {
     fn default() -> Self {
         Daemon {
-            interval: "60s".into(),
+            interval: "60s".parse().expect("positive fixed interval"),
         }
     }
 }
 
 impl Daemon {
     pub fn interval_secs(&self) -> f64 {
-        parse_duration_secs(&self.interval).unwrap_or(60.0)
+        self.interval.as_secs_f64()
     }
 }
 
@@ -138,18 +142,17 @@ fn default_concurrency() -> usize {
     1
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct VolatilityMap {
-    pub immutable: String,
-    pub slow: String,
-    pub days: String,
-    pub hours: String,
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Decay {
+    /// Applied at ingest when no half-life is supplied; saved with the fact.
+    #[serde(default)]
+    pub default_half_life: HalfLife,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sandbox {
     pub runtime: String,
-    pub timeout: String,
+    pub timeout: FixedDuration,
     #[serde(default)]
     pub default_caps: Vec<String>,
 }
@@ -165,43 +168,19 @@ impl Default for Budget {
     }
 }
 
-impl Default for VolatilityMap {
-    fn default() -> Self {
-        VolatilityMap {
-            immutable: "never".into(),
-            slow: "90d".into(),
-            days: "3d".into(),
-            hours: "6h".into(),
-        }
-    }
-}
-
 impl Default for Sandbox {
     fn default() -> Self {
         Sandbox {
             runtime: "deno".into(),
-            timeout: "10s".into(),
+            timeout: "10s".parse().expect("positive fixed timeout"),
             default_caps: vec![],
         }
     }
 }
 
-impl VolatilityMap {
-    /// Half-life in seconds for a class; `None` means it never decays.
-    pub fn half_life_secs(&self, v: Volatility) -> Option<f64> {
-        let raw = match v {
-            Volatility::Immutable => &self.immutable,
-            Volatility::Slow => &self.slow,
-            Volatility::Days => &self.days,
-            Volatility::Hours => &self.hours,
-        };
-        parse_duration_secs(raw)
-    }
-}
-
 impl Sandbox {
     pub fn timeout_secs(&self) -> f64 {
-        parse_duration_secs(&self.timeout).unwrap_or(10.0)
+        self.timeout.as_secs_f64()
     }
 }
 
@@ -215,8 +194,20 @@ impl Config {
         Ok(toml::from_str(&text)?)
     }
 
-    pub fn load_or_default(path: &std::path::Path) -> Config {
-        Config::load(path).unwrap_or_default()
+    /// Resolve a class from an old fact without changing its configured decay.
+    pub(crate) fn legacy_half_life(&self, class: &str) -> Result<HalfLife> {
+        let default = match class {
+            "immutable" => HalfLife::Never,
+            "slow" => "P90D".parse().expect("positive default half-life"),
+            "days" => HalfLife::default(),
+            "hours" => "PT6H".parse().expect("positive default half-life"),
+            _ => {
+                return Err(Error::Config(format!(
+                    "unknown legacy volatility class: {class}"
+                )))
+            }
+        };
+        Ok(self.volatility.get(class).copied().unwrap_or(default))
     }
 
     pub fn to_toml(&self) -> String {
@@ -266,32 +257,22 @@ impl Config {
     }
 }
 
-/// Parse a duration like `90d`, `6h`, `30m`, `10s`. `"never"`/`"immutable"` →
-/// `None` (no decay).
+/// Parse a positive elapsed duration, including ISO 8601 and shorthand.
+/// Returns `None` for invalid input or calendar years and months.
 pub fn parse_duration_secs(s: &str) -> Option<f64> {
-    let s = s.trim();
-    if s.eq_ignore_ascii_case("never") || s.eq_ignore_ascii_case("immutable") {
-        return None;
-    }
-    let (num, unit) = s.split_at(s.find(|c: char| c.is_alphabetic()).unwrap_or(s.len()));
-    let n: f64 = num.trim().parse().ok()?;
-    let mult = match unit.trim() {
-        "s" | "" => 1.0,
-        "m" => 60.0,
-        "h" => 3600.0,
-        "d" => 86_400.0,
-        "w" => 604_800.0,
-        _ => return None,
-    };
-    Some(n * mult)
+    s.parse::<FixedDuration>()
+        .ok()
+        .map(FixedDuration::as_secs_f64)
 }
 
-/// Validate that an op constructor was not asked to set an unknown duration.
+/// Parse a positive elapsed duration.
 ///
 /// # Errors
-/// Returns an error if `s` is not a recognized duration like `90d` or `6h`.
+/// Returns an error for invalid input, or years and months without an anchor.
 pub fn require_duration(s: &str) -> Result<f64> {
-    parse_duration_secs(s).ok_or_else(|| Error::Config(format!("bad duration: {s}")))
+    s.parse::<FixedDuration>()
+        .map(FixedDuration::as_secs_f64)
+        .map_err(|e| Error::Config(format!("bad duration `{s}`: {e}")))
 }
 
 #[cfg(test)]
@@ -305,11 +286,8 @@ mod tests {
 per_tick = 20
 epsilon  = 0.02
 
-[volatility]
-immutable = "never"
-slow      = "90d"
-days      = "3d"
-hours     = "6h"
+[decay]
+default_half_life = "P3D"
 
 [sandbox]
 runtime      = "deno"
@@ -319,15 +297,7 @@ default_caps = []
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.budget.per_tick, 20);
         assert_eq!(cfg.budget.epsilon, 0.02);
-        assert_eq!(cfg.volatility.half_life_secs(Volatility::Immutable), None);
-        assert_eq!(
-            cfg.volatility.half_life_secs(Volatility::Hours),
-            Some(6.0 * 3600.0)
-        );
-        assert_eq!(
-            cfg.volatility.half_life_secs(Volatility::Days),
-            Some(3.0 * 86400.0)
-        );
+        assert_eq!(cfg.decay.default_half_life, HalfLife::default());
         assert_eq!(cfg.sandbox.runtime, "deno");
         assert_eq!(cfg.sandbox.timeout_secs(), 10.0);
     }
@@ -338,6 +308,42 @@ default_caps = []
         assert_eq!(parse_duration_secs("6h"), Some(21600.0));
         assert_eq!(parse_duration_secs("90d"), Some(7_776_000.0));
         assert_eq!(parse_duration_secs("30m"), Some(1800.0));
+    }
+
+    #[test]
+    fn rejects_invalid_durations_in_every_config_field() {
+        for input in [
+            "[decay]\ndefault_half_life = \"0s\"",
+            "[decay]\ndefault_half_life = \"oops\"",
+            "[decay]\ndefault_half_life = \"-P1D\"",
+            "[daemon]\ninterval = \"never\"",
+            "[daemon]\ninterval = \"P1M\"",
+            "[daemon]\ninterval = \"PT0S\"",
+            "[sandbox]\nruntime = \"deno\"\ntimeout = \"NaN\"",
+            "[volatility]\nhours = \"typo\"",
+        ] {
+            assert!(toml::from_str::<Config>(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn duration_forms_roundtrip_through_config() {
+        let cfg: Config = toml::from_str(
+            r#"
+[decay]
+default_half_life = "P1M"
+[daemon]
+interval = "1 minute, 30 seconds"
+[sandbox]
+runtime = "deno"
+timeout = "PT0.5S"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.decay.default_half_life.to_string(), "P1M");
+        assert_eq!(cfg.daemon.interval_secs(), 90.0);
+        assert_eq!(cfg.sandbox.timeout_secs(), 0.5);
+        assert_eq!(toml::from_str::<Config>(&cfg.to_toml()).unwrap(), cfg);
     }
 
     #[test]

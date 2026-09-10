@@ -13,14 +13,15 @@ use clap::{Args, Parser, Subcommand};
 use unicode_normalization::UnicodeNormalization;
 
 use jishuken::calibration::{brier_score, recalibrate, reliability_bins};
-use jishuken::decay::{decayed_confidence, half_life_secs};
+use jishuken::decay::decayed_confidence;
+use jishuken::duration::FixedDuration;
 use jishuken::engine;
 use jishuken::ground::locator::parse_source;
 use jishuken::predicate::Predicate;
 use jishuken::scheduler;
 use jishuken::schema::{
     Claim, CommandSource, Element, Epistemics, Fact, FactValue, GroundBinding, GroundSource,
-    Groundedness, Locator, SourceRef, SourceRoot, TriageSource, Volatility,
+    Groundedness, HalfLife, Locator, SourceRef, SourceRoot, TriageSource,
 };
 use jishuken::store::JishukenStore;
 use jishuken::verify::authority;
@@ -106,7 +107,7 @@ enum Command {
     Serve {
         /// Interval between ticks, e.g. `60s`, `5m`. Overrides `[daemon]`.
         #[arg(long)]
-        interval: Option<String>,
+        interval: Option<FixedDuration>,
         /// Run a single tick and exit.
         #[arg(long)]
         once: bool,
@@ -138,8 +139,10 @@ struct AddArgs {
     /// Read a JSON value (array → set-valued fact) from a file.
     #[arg(long)]
     json: Option<PathBuf>,
-    #[arg(long, default_value = "days")]
-    volatility: Volatility,
+    /// Confidence half-life: ISO 8601, shorthand (14d, 1h30m), or never.
+    /// Defaults to `decay.default_half_life` in `ken.toml` (3 days).
+    #[arg(long)]
+    half_life: Option<HalfLife>,
     /// Name where the truth should be checked (a hint; stays Ungrounded
     /// until the control plane grounds it).
     #[arg(long)]
@@ -316,7 +319,7 @@ fn cmd_add(
         key,
         value,
         json,
-        volatility,
+        half_life,
         ground,
         meta_confidence,
     }: AddArgs,
@@ -371,7 +374,7 @@ fn cmd_add(
         claim,
         value,
         triage,
-        volatility,
+        half_life.unwrap_or(store.config().decay.default_half_life),
         draft_ground,
     ))?;
     println!("{key} ingested ungrounded ({id})");
@@ -440,8 +443,8 @@ fn cmd_ground(
 fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()> {
     let fact = store.read_fact_by_key(key)?;
     let now = Utc::now();
-    let conf = decayed_confidence(&fact, now, store.config());
-    let due = due_at(&fact, store);
+    let conf = decayed_confidence(&fact, now);
+    let due = due_at(&fact);
 
     if json {
         let out = serde_json::json!({
@@ -451,6 +454,7 @@ fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()
             "groundedness": groundedness_json(&fact.epistemics.groundedness),
             "grounds": grounds_json(&fact),
             "source_hint": fact.source_hint.as_ref().map(jishuken::ground::render_ground),
+            "half_life": fact.schedule.half_life,
             "last_verified": fact.schedule.last_verified,
             "due": due,
         });
@@ -466,9 +470,8 @@ fn cmd_recall(store: &JishukenStore, key: &str, json: bool) -> anyhow::Result<()
         );
     }
     println!(
-        "  confidence   {:.2}   volatility={}",
-        conf,
-        volatility_label(fact.schedule.volatility)
+        "  confidence   {:.2}   half-life={}",
+        conf, fact.schedule.half_life
     );
     match &fact.epistemics.groundedness {
         Groundedness::Ungrounded { .. } => {
@@ -580,14 +583,14 @@ fn cmd_stale(store: &JishukenStore, limit: usize) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
     let costs = store.cost_table();
-    let ranked = scheduler::rank(&facts, now, store.config(), &costs);
+    let ranked = scheduler::rank(&facts, now, &costs);
     if ranked.is_empty() {
         println!("no facts");
         return Ok(());
     }
     for f in ranked.into_iter().take(limit) {
-        let voi = scheduler::voi_score(f, now, store.config(), &costs);
-        let conf = decayed_confidence(f, now, store.config());
+        let voi = scheduler::voi_score(f, now, &costs);
+        let conf = decayed_confidence(f, now);
         println!(
             "{:<28} voi={:>7.3}  conf={:.2}  {}",
             f.claim.key(),
@@ -638,16 +641,11 @@ fn cmd_search(
                 .as_ref()
                 .is_none_or(|g| f.epistemics.groundedness.label() == g.to_lowercase())
         })
-        .filter(|f| !due || is_due(f, store, now))
+        .filter(|f| !due || is_due(f, now))
         .collect();
 
     hits.sort_by(|a, b| {
-        scheduler::voi_score(b, now, store.config(), &costs).total_cmp(&scheduler::voi_score(
-            a,
-            now,
-            store.config(),
-            &costs,
-        ))
+        scheduler::voi_score(b, now, &costs).total_cmp(&scheduler::voi_score(a, now, &costs))
     });
     hits.truncate(limit);
 
@@ -658,7 +656,7 @@ fn cmd_search(
                 serde_json::json!({
                     "key": f.claim.key(),
                     "value": value_json(&f.value),
-                    "confidence": round2(decayed_confidence(f, now, store.config())),
+                    "confidence": round2(decayed_confidence(f, now)),
                     "groundedness": groundedness_json(&f.epistemics.groundedness),
                     "grounds": grounds_json(f),
                 })
@@ -680,7 +678,7 @@ fn cmd_search(
             "{:<28} {:<10} conf={:.2}  {}",
             f.claim.key(),
             f.epistemics.groundedness.label(),
-            decayed_confidence(f, now, store.config()),
+            decayed_confidence(f, now),
             truncate(&f.value.render(), 40),
         );
     }
@@ -741,7 +739,7 @@ fn cmd_tick(store: &JishukenStore) -> anyhow::Result<()> {
 
 fn cmd_serve(
     store: &JishukenStore,
-    interval: Option<String>,
+    interval: Option<FixedDuration>,
     once: bool,
     install: bool,
     uninstall: bool,
@@ -775,9 +773,8 @@ fn cmd_serve(
     }
 
     let secs = interval
-        .as_deref()
-        .and_then(jishuken::config::parse_duration_secs)
-        .unwrap_or_else(|| store.config().daemon.interval_secs());
+        .unwrap_or(store.config().daemon.interval)
+        .as_secs_f64();
 
     loop {
         match engine::tick(store) {
@@ -791,7 +788,7 @@ fn cmd_serve(
         if once {
             break;
         }
-        std::thread::sleep(Duration::from_secs_f64(secs.max(1.0)));
+        std::thread::sleep(Duration::from_secs_f64(secs));
     }
     Ok(())
 }
@@ -970,22 +967,14 @@ fn latest_ground(fact: &Fact, outcome: jishuken::schema::Outcome) -> Option<Stri
         .map(jishuken::ground::render_ground)
 }
 
-fn volatility_label(v: Volatility) -> &'static str {
-    match v {
-        Volatility::Immutable => "immutable",
-        Volatility::Slow => "slow",
-        Volatility::Days => "days",
-        Volatility::Hours => "hours",
-    }
+fn due_at(fact: &Fact) -> Option<DateTime<Utc>> {
+    fact.schedule
+        .half_life
+        .deadline(fact.schedule.last_verified)
 }
 
-fn due_at(fact: &Fact, store: &JishukenStore) -> Option<DateTime<Utc>> {
-    let hl = half_life_secs(fact.schedule.volatility, store.config())?;
-    Some(fact.schedule.last_verified + chrono::Duration::seconds(hl as i64))
-}
-
-fn is_due(fact: &Fact, store: &JishukenStore, now: DateTime<Utc>) -> bool {
-    due_at(fact, store).is_some_and(|d| d <= now)
+fn is_due(fact: &Fact, now: DateTime<Utc>) -> bool {
+    due_at(fact).is_some_and(|d| d <= now)
 }
 
 fn round2(x: f64) -> f64 {

@@ -184,32 +184,11 @@ pub enum TriageSource {
     Manual,
 }
 
-/// Volatility class sets the process noise Q.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Volatility {
-    Immutable,
-    Slow,
-    Days,
-    Hours,
-}
-
-impl std::str::FromStr for Volatility {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "immutable" => Ok(Volatility::Immutable),
-            "slow" => Ok(Volatility::Slow),
-            "days" => Ok(Volatility::Days),
-            "hours" => Ok(Volatility::Hours),
-            other => Err(format!("unknown volatility class: {other}")),
-        }
-    }
-}
+pub use crate::duration::HalfLife;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleMeta {
-    pub volatility: Volatility,
+    pub half_life: HalfLife,
     pub centrality: f64,
     pub last_verified: Timestamp,
     /// Posterior variance at the last verification; inflates with `q * dt`.

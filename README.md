@@ -37,7 +37,7 @@ In the project where your agent works, create a store and remember a fact:
 
 ```sh
 ken init
-ken add release.owner ryu --volatility days
+ken add release.owner ryu --half-life P3D
 ken recall release.owner
 ```
 
@@ -272,10 +272,18 @@ a changed hash makes the check fail until its binding is updated.
 ### Confidence
 
 Confidence tends toward `0.5` as a fact ages.
-The volatility class sets its half-life:
-six hours for `hours`, three days for `days`, and ninety days for `slow`.
-`immutable` disables decay, including for ungrounded facts,
-so reserve it for values that cannot change.
+Set its half-life with `--half-life P3D` (three days).
+After one half-life, confidence of `0.9` becomes `0.7`.
+Durations accept ISO 8601 (`PT15M`, `P2W`, `P1Y`)
+and shorthand (`15m`, `2w`, `1h30m`, `1 hour 30 minutes`).
+Lowercase, a leading `+`, and decimal fractions such as `PT1.5H` are accepted.
+`P1M` means one calendar month; `PT1M` and `1m` mean one minute.
+Months and years count from the last verification date in UTC,
+constrained to the destination month's last day;
+days are always 24 hours.
+Durations must be positive, with at most nanosecond precision.
+`never` disables decay, including for ungrounded facts,
+without making them verified.
 A fact without a source can still age, but cannot earn a verification result.
 
 A confirmation or refutation updates confidence with a scalar Kalman filter.
@@ -288,7 +296,7 @@ their results move confidence less.
 Checks return `Confirmed`, `Refuted`, `Errored`, or `Inconclusive`.
 Only confirmation and refutation update confidence.
 A timeout or execution error leaves the previous evidence in place;
-confidence continues to age according to the configured volatility.
+confidence continues to age according to the fact’s half-life.
 An unavailable source never counts as a fresh confirmation.
 
 The engine logs prior confidence and check outcomes
@@ -339,11 +347,8 @@ audit_per_tick = 5
 epsilon = 0.02
 concurrency = 1
 
-[volatility]
-immutable = "never"
-slow = "90d"
-days = "3d"
-hours = "6h"
+[decay]
+default_half_life = "P3D"
 
 [daemon]
 interval = "60s"
@@ -353,6 +358,11 @@ runtime = "deno"
 timeout = "10s"
 default_caps = []
 ```
+
+`default_half_life` applies to new ingests that omit a half-life.
+Each fact saves its duration, so changing the default leaves existing facts alone.
+Timeouts and intervals accept the same duration syntax,
+except for calendar months and years, which need a reference date.
 
 `per_tick` limits selected facts, and `audit_per_tick` limits additional audits.
 Each selected fact can run several ground checks,

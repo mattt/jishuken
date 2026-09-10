@@ -12,13 +12,13 @@
 
 use std::path::PathBuf;
 
-use jishuken::decay::{decayed_confidence, half_life_secs};
+use jishuken::decay::decayed_confidence;
 use jishuken::ground::locator::parse_source;
 use jishuken::ground::{ground_source_for, render_ground};
 use jishuken::predicate::Predicate;
 use jishuken::scheduler;
 use jishuken::schema::{
-    Claim, Fact, FactValue, GroundBinding, Groundedness, Outcome, TriageSource, Volatility,
+    Claim, Fact, FactValue, GroundBinding, Groundedness, HalfLife, Outcome, TriageSource,
 };
 use jishuken::store::JishukenStore;
 use jishuken::write::WriteOp;
@@ -81,12 +81,14 @@ pub struct RecallParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IngestParams {
     /// `entity.relation`
     key: String,
     value: String,
-    /// One of: immutable, slow, days, hours.
-    volatility: Option<String>,
+    /// Confidence half-life: ISO 8601 (P14D), shorthand (14d, 1h30m), or never.
+    /// Defaults to `decay.default_half_life` in `ken.toml` (3 days).
+    half_life: Option<String>,
     meta_confidence: Option<f64>,
     /// Where this should be checked, e.g. `src/auth/verify.rs` or
     /// `wiki:Architecture.md#authentication`. A hint only: the fact stays
@@ -121,9 +123,12 @@ pub struct RecallOutput {
     /// Suggested source awaiting an explicit binding; never used by the scheduler.
     #[serde(skip_serializing_if = "Option::is_none")]
     source_hint: Option<String>,
+    /// Confidence half-life as ISO 8601, or `never`.
+    half_life: String,
     /// When the fact was last confirmed or refuted (RFC 3339).
     last_verified: String,
-    /// When it next falls due for a re-check (RFC 3339); absent if it never decays.
+    /// When it next falls due for a re-check (RFC 3339).
+    /// Absent if it never decays or the date is out of range.
     due: Option<String>,
 }
 
@@ -192,11 +197,13 @@ impl JishukenServer {
     fn ken_ingest(&self, Parameters(p): Parameters<IngestParams>) -> Result<String, String> {
         let store = self.open()?;
         let claim = Claim::parse_key(&p.key).map_err(|e| e.to_string())?;
-        let volatility = p
-            .volatility
+        let half_life = p
+            .half_life
             .as_deref()
-            .and_then(|s| s.parse::<Volatility>().ok())
-            .unwrap_or(Volatility::Days);
+            .map(str::parse::<HalfLife>)
+            .transpose()
+            .map_err(|e| format!("invalid half_life: {e}"))?
+            .unwrap_or(store.config().decay.default_half_life);
         let triage = match p.meta_confidence {
             Some(mc) => TriageSource::Llm {
                 meta_confidence: mc,
@@ -225,7 +232,7 @@ impl JishukenServer {
                 value: Value::String(p.value),
             },
             triage,
-            volatility,
+            half_life,
             draft_ground,
         );
         let id = store.apply(op).map_err(|e| e.to_string())?;
@@ -283,7 +290,7 @@ impl JishukenServer {
         let matches: Vec<Value> = hits
             .iter()
             .map(|f| {
-                let conf = decayed_confidence(f, now, store.config());
+                let conf = decayed_confidence(f, now);
                 json!({
                     "key": f.claim.key(),
                     "value": value_of(&f.value),
@@ -344,10 +351,12 @@ impl JishukenServer {
 fn recall_output(store: &JishukenStore, key: &str) -> Result<RecallOutput, String> {
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
-    let conf = decayed_confidence(&fact, now, store.config());
-    let due = half_life_secs(fact.schedule.volatility, store.config()).map(|hl| {
-        (fact.schedule.last_verified + chrono::Duration::seconds(hl as i64)).to_rfc3339()
-    });
+    let conf = decayed_confidence(&fact, now);
+    let due = fact
+        .schedule
+        .half_life
+        .deadline(fact.schedule.last_verified)
+        .map(|at| at.to_rfc3339());
     Ok(RecallOutput {
         key: fact.claim.key(),
         value: value_of(&fact.value),
@@ -355,6 +364,7 @@ fn recall_output(store: &JishukenStore, key: &str) -> Result<RecallOutput, Strin
         groundedness: groundedness_out(&fact.epistemics.groundedness),
         grounds: grounds_out(&fact),
         source_hint: fact.source_hint.as_ref().map(render_ground),
+        half_life: fact.schedule.half_life.to_string(),
         last_verified: fact.schedule.last_verified.to_rfc3339(),
         due,
     })
@@ -402,15 +412,15 @@ fn stale_value(store: &JishukenStore) -> Result<Value, String> {
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let costs = store.cost_table();
-    let ranked = scheduler::rank(&facts, now, store.config(), &costs);
+    let ranked = scheduler::rank(&facts, now, &costs);
     let stale: Vec<Value> = ranked
         .into_iter()
         .take(20)
         .map(|f| {
             json!({
                 "key": f.claim.key(),
-                "voi": round2(scheduler::voi_score(f, now, store.config(), &costs)),
-                "confidence": round2(decayed_confidence(f, now, store.config())),
+                "voi": round2(scheduler::voi_score(f, now, &costs)),
+                "confidence": round2(decayed_confidence(f, now)),
                 "groundedness": f.epistemics.groundedness.label(),
             })
         })
@@ -618,7 +628,7 @@ fn prompt_messages(
                  regret forgetting: things that were true when written but go stale as the \
                  world moves (a file a function lives in, a release owner, a staging URL, a \
                  dependency version). For each, call `ken_ingest` with key `entity.relation`, \
-                 a `volatility` of immutable/slow/days/hours, and a `ground` hint naming where \
+                 a `half_life` duration such as P3D or 12h (or never), and a `ground` hint naming where \
                  it can be checked (a file path, a command, or a `scheme:reference`). Skip \
                  anything that is a transient detail, an opinion, or belongs in a RAG corpus \
                  rather than as a verifiable claim. Every ingested fact lands ungrounded; the \
@@ -837,10 +847,65 @@ mod tests {
         IngestParams {
             key: key.to_string(),
             value: value.to_string(),
-            volatility: None,
+            half_life: None,
             meta_confidence: None,
             ground: None,
         }
+    }
+
+    #[test]
+    fn ingest_validates_half_lives_and_uses_the_configured_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let mut config = store.config().clone();
+        config.decay.default_half_life = "2w".parse().unwrap();
+        std::fs::write(dir.path().join("ken.toml"), config.to_toml()).unwrap();
+        let server = JishukenServer {
+            store_path: dir.path().to_path_buf(),
+        };
+        for (input, expected) in [
+            (None, "P14D"),
+            (Some("pt1h30m"), "PT1H30M"),
+            (Some("1 hour, 30 minutes"), "PT1H30M"),
+            (Some("P1M"), "P1M"),
+            (Some("never"), "never"),
+            (Some("1ns"), "PT0.000000001S"),
+        ] {
+            let mut params = ingest_params("test.duration", "present");
+            params.half_life = input.map(str::to_owned);
+            server.ken_ingest(Parameters(params)).unwrap();
+            let recalled = server
+                .ken_recall(Parameters(RecallParams {
+                    key: "test.duration".into(),
+                }))
+                .unwrap()
+                .0;
+            assert_eq!(recalled.half_life, expected);
+            assert_eq!(recalled.groundedness.state, "ungrounded");
+            assert_eq!(recalled.due.is_none(), expected == "never");
+        }
+        let before = std::fs::read(dir.path().join("ops.jsonl")).unwrap();
+        for input in ["nonsense", "PT0S", "-P1D", "NaN", "", "PT1.5H1M"] {
+            let mut params = ingest_params("test.duration", "must not replace");
+            params.half_life = Some(input.into());
+            assert!(server
+                .ken_ingest(Parameters(params))
+                .unwrap_err()
+                .contains("invalid half_life"));
+        }
+        assert_eq!(std::fs::read(dir.path().join("ops.jsonl")).unwrap(), before);
+        assert_eq!(
+            store
+                .read_fact_by_key("test.duration")
+                .unwrap()
+                .value
+                .render(),
+            "present"
+        );
+        assert!(serde_json::from_str::<IngestParams>(
+            r#"{"key":"test.duration","value":"x","volatility":"slow"}"#
+        )
+        .is_err());
     }
 
     /// Drive the served tool surface end to end against a real store:

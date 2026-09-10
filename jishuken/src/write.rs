@@ -27,8 +27,8 @@
 
 use crate::calibration::Recalibrator;
 use crate::schema::{
-    Claim, Element, Epistemics, FactId, FactValue, GeneratorHash, GroundBinding, Resolved,
-    TriageSource, Volatility,
+    Claim, Element, Epistemics, FactId, FactValue, GeneratorHash, GroundBinding, HalfLife,
+    Resolved, TriageSource,
 };
 use crate::verify::ControlToken;
 
@@ -55,7 +55,7 @@ pub enum WriteOp {
         claim: Claim,
         value: FactValue,
         triage: TriageSource,
-        volatility: Volatility,
+        half_life: HalfLife,
         draft_ground: Option<GroundBinding>,
     },
 
@@ -111,14 +111,14 @@ impl WriteOp {
         claim: Claim,
         value: FactValue,
         triage: TriageSource,
-        volatility: Volatility,
+        half_life: HalfLife,
         draft_ground: Option<GroundBinding>,
     ) -> WriteOp {
         WriteOp::Ingest {
             claim,
             value,
             triage,
-            volatility,
+            half_life,
             draft_ground,
         }
     }
@@ -185,7 +185,7 @@ mod tests {
                 value: serde_json::json!("x"),
             },
             TriageSource::Ingest,
-            Volatility::Hours,
+            "PT6H".parse::<HalfLife>().unwrap(),
             None,
         );
         assert_eq!(op.tag(), "Ingest");

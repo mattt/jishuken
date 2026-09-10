@@ -109,7 +109,7 @@ impl JishukenStore {
         if !root.join("ken.toml").is_file() {
             return Err(Error::StoreNotFound);
         }
-        let config = Config::load_or_default(&root.join("ken.toml"));
+        let config = Config::load(&root.join("ken.toml"))?;
         let store = JishukenStore {
             root: root.to_path_buf(),
             config,
@@ -249,11 +249,33 @@ impl JishukenStore {
         Ok(out)
     }
 
+    /// Upgrade the schedule in memory. History keeps its original bytes, so
+    /// undo and legacy hint recovery use this same decoder for old snapshots.
+    fn decode_schedule(&self, mut value: serde_json::Value) -> Result<Fact> {
+        if let Some(schedule) = value
+            .get_mut("schedule")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if !schedule.contains_key("half_life") {
+                if let Some(class) = schedule.remove("volatility") {
+                    let class = class
+                        .as_str()
+                        .ok_or_else(|| Error::Store("invalid legacy volatility class".into()))?;
+                    schedule.insert(
+                        "half_life".into(),
+                        serde_json::to_value(self.config.legacy_half_life(class)?)?,
+                    );
+                }
+            }
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
     /// Identify old ingest hints from history, preserving explicit ground bindings.
     fn decode_fact(&self, text: &str) -> Result<Fact> {
         let value: serde_json::Value = serde_json::from_str(text)?;
         let legacy = value.get("source_hint").is_none();
-        let mut fact: Fact = serde_json::from_value(value)?;
+        let mut fact = self.decode_schedule(value)?;
         fact.claim.normalize();
         if Claim::parse_key(&fact.id.0)?.key() != fact.claim.key() {
             return Err(Error::Store("fact ID does not match its claim".into()));
@@ -275,11 +297,17 @@ impl JishukenStore {
             .changes
             .iter()
             .filter_map(|c| c.after.as_deref())
-            .filter_map(|text| serde_json::from_str::<Fact>(text).ok())
-            .find(|saved| saved.claim.key() == fact.claim.key());
+            .filter_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            .find(|saved| {
+                saved
+                    .get("claim")
+                    .and_then(|claim| serde_json::from_value::<Claim>(claim.clone()).ok())
+                    .is_some_and(|claim| claim.key() == fact.claim.key())
+            });
         let Some(ingested) = ingested else {
             return Ok(fact);
         };
+        let ingested = self.decode_schedule(ingested)?;
         let Some(hint) = ingested.grounds.first() else {
             return Ok(fact);
         };
@@ -639,7 +667,7 @@ impl JishukenStore {
                 mut claim,
                 value,
                 triage,
-                volatility,
+                half_life,
                 draft_ground,
             } => {
                 claim.normalize();
@@ -658,7 +686,7 @@ impl JishukenStore {
                         groundedness: Groundedness::Ungrounded { source: triage },
                     },
                     schedule: ScheduleMeta {
-                        volatility,
+                        half_life,
                         centrality: 1.0,
                         last_verified: now,
                         variance_at_verify: INGEST_VARIANCE,
@@ -722,8 +750,8 @@ impl JishukenStore {
                 }
 
                 if outcome.updates_belief() {
-                    let prior_var = decayed_variance(&fact, now, &self.config);
-                    let prior = crate::decay::decayed_confidence(&fact, now, &self.config);
+                    let prior_var = decayed_variance(&fact, now);
+                    let prior = crate::decay::decayed_confidence(&fact, now);
                     let confirmed = outcome == Outcome::Confirmed;
                     let (conf, var) = kalman_update(prior, prior_var, confirmed, net);
                     fact.epistemics.confidence = conf;
@@ -872,8 +900,8 @@ mod tests {
     use crate::ground::locator::parse_source;
     use crate::predicate::Predicate;
     use crate::schema::{
-        Claim, Fact, FactValue, GeneratorHash, GroundBinding, GroundSource, Groundedness, Resolved,
-        TriageSource, Volatility,
+        Claim, Fact, FactValue, GeneratorHash, GroundBinding, GroundSource, Groundedness, HalfLife,
+        Resolved, TriageSource,
     };
     use crate::test_support::verified_scalar;
     use crate::write::{Outcome, WriteOp};
@@ -892,7 +920,7 @@ mod tests {
                 claim,
                 scalar("v"),
                 TriageSource::Ingest,
-                Volatility::Days,
+                HalfLife::default(),
                 None,
             ))
             .unwrap();
@@ -944,7 +972,7 @@ mod tests {
                     Claim::parse_key(key).unwrap(),
                     scalar(key),
                     TriageSource::Ingest,
-                    Volatility::Days,
+                    HalfLife::default(),
                     None,
                 ))
                 .unwrap();
@@ -997,7 +1025,7 @@ mod tests {
                 before.claim.clone(),
                 scalar("new"),
                 TriageSource::Ingest,
-                Volatility::Days,
+                HalfLife::default(),
                 None
             ))
             .is_err());
@@ -1028,7 +1056,7 @@ mod tests {
                 before.claim.clone(),
                 scalar("new"),
                 TriageSource::Ingest,
-                Volatility::Days,
+                HalfLife::default(),
                 None,
             ))
             .unwrap_err();
@@ -1061,7 +1089,7 @@ mod tests {
                     raw,
                     scalar("first"),
                     TriageSource::Ingest,
-                    Volatility::Days,
+                    HalfLife::default(),
                     None,
                 ))
                 .unwrap();
@@ -1073,7 +1101,7 @@ mod tests {
                     second,
                     scalar("second"),
                     TriageSource::Ingest,
-                    Volatility::Days,
+                    HalfLife::default(),
                     None,
                 ))
                 .unwrap();
@@ -1127,7 +1155,7 @@ mod tests {
                 Claim::parse_key("café.owner").unwrap(),
                 scalar("replace"),
                 TriageSource::Ingest,
-                Volatility::Days,
+                HalfLife::default(),
                 None
             ))
             .is_err());
@@ -1152,6 +1180,11 @@ mod tests {
             }
             let mut snapshot = serde_json::to_value(&fact).unwrap();
             snapshot.as_object_mut().unwrap().remove("source_hint");
+            snapshot["schedule"]
+                .as_object_mut()
+                .unwrap()
+                .remove("half_life");
+            snapshot["schedule"]["volatility"] = "days".into();
             ingest.changes[0].after = Some(snapshot.to_string());
             let mut log = String::new();
             for record in &records {
@@ -1167,6 +1200,11 @@ mod tests {
             fact.epistemics.confidence = 0.9;
             let mut saved = serde_json::to_value(&fact).unwrap();
             saved.as_object_mut().unwrap().remove("source_hint");
+            saved["schedule"]
+                .as_object_mut()
+                .unwrap()
+                .remove("half_life");
+            saved["schedule"]["volatility"] = "days".into();
             std::fs::write(store.root().join(fact.rel_path()), saved.to_string()).unwrap();
             let loaded = store.read_fact_by_key(key).unwrap();
             if draft {
@@ -1181,6 +1219,86 @@ mod tests {
                 assert_eq!(loaded, fact);
             }
         }
+    }
+
+    #[test]
+    fn legacy_half_lives_preserve_custom_mapping_and_undo_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let mut config = store.config().clone();
+        config
+            .volatility
+            .insert("hours".into(), "PT45M".parse().unwrap());
+        config.decay.default_half_life = "P1Y".parse().unwrap();
+        std::fs::write(dir.path().join("ken.toml"), config.to_toml()).unwrap();
+        let store = JishukenStore::open(dir.path()).unwrap();
+        for (class, expected) in [
+            ("immutable", "never"),
+            ("slow", "P90D"),
+            ("days", "P3D"),
+            ("hours", "PT45M"),
+        ] {
+            let mut fact = verified_scalar(&format!("legacy.{class}"));
+            // Keep these ungrounded so migration cannot accidentally confer trust.
+            fact.epistemics.groundedness = Groundedness::Ungrounded {
+                source: TriageSource::Ingest,
+            };
+            fact.grounds.clear();
+            let mut value = serde_json::to_value(&fact).unwrap();
+            let schedule = value["schedule"].as_object_mut().unwrap();
+            schedule.remove("half_life");
+            schedule.insert("volatility".into(), class.into());
+            let bytes = value.to_string();
+            let path = store.root().join(fact.rel_path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let before = std::fs::read(store.ops_path()).unwrap();
+            let loaded = store.read_fact(&fact.id).unwrap();
+            assert_eq!(loaded.schedule.half_life.to_string(), expected);
+            assert_eq!(loaded.epistemics, fact.epistemics);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            assert_eq!(std::fs::read(store.ops_path()).unwrap(), before);
+
+            store
+                .apply(crate::verify::authority::reschedule(fact.id.clone(), 5.0))
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["schedule"]["half_life"], expected);
+            assert!(saved["schedule"].get("volatility").is_none());
+            store.undo().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), bytes);
+            assert_eq!(
+                store
+                    .read_fact(&fact.id)
+                    .unwrap()
+                    .schedule
+                    .half_life
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_config_and_saved_half_lives_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        ingest(&store, "test.duration");
+        let fact = store.read_fact_by_key("test.duration").unwrap();
+        let path = store.root().join(fact.rel_path());
+        for input in ["0d", "typo", "-P1D"] {
+            let mut saved = serde_json::to_value(&fact).unwrap();
+            saved["schedule"]["half_life"] = input.into();
+            std::fs::write(&path, saved.to_string()).unwrap();
+            assert!(store.read_fact(&fact.id).is_err());
+        }
+        std::fs::write(
+            dir.path().join("ken.toml"),
+            "[decay]\ndefault_half_life = \"typo\"",
+        )
+        .unwrap();
+        assert!(JishukenStore::open(dir.path()).is_err());
     }
 
     #[test]
