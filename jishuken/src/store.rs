@@ -79,6 +79,17 @@ pub struct JishukenStore {
     pending: Mutex<Vec<Change>>,
 }
 
+/// Explicitly release the lock before closing its descriptor: another thread
+/// may have forked while it was held, keeping the shared description alive.
+#[derive(Debug)]
+struct StoreLock(std::fs::File);
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl JishukenStore {
     /// Discover the store by walking up from `start` for a `.ken/` directory,
     /// the way `git` finds `.git/`. Honors an explicit override first.
@@ -811,10 +822,10 @@ impl JishukenStore {
         }
     }
 
-    /// Hold an OS lock until the returned file closes, including on process exit.
-    fn lock(&self) -> Result<std::fs::File> {
+    /// Hold an OS lock until the guard drops, including on process exit.
+    fn lock(&self) -> Result<StoreLock> {
         let path = self.root.join("lock");
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
@@ -829,10 +840,11 @@ impl JishukenStore {
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        file.set_len(0)?;
-        write!(file, "{}", std::process::id())?;
+        let mut lock = StoreLock(file);
+        lock.0.set_len(0)?;
+        write!(lock.0, "{}", std::process::id())?;
         transaction::recover(&self.root)?;
-        Ok(file)
+        Ok(lock)
     }
 }
 
@@ -1302,11 +1314,29 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn finished_write_releases_lock_even_if_a_descriptor_was_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JishukenStore::init(dir.path()).unwrap();
+        let lock = store.lock().unwrap();
+        // A concurrent fork can inherit this same open-file description until exec.
+        let inherited = lock.0.try_clone().unwrap();
+        drop(lock);
+        let reopened = JishukenStore::open(dir.path());
+        drop(inherited);
+        assert!(
+            reopened.is_ok(),
+            "finished writer left its lock held: {reopened:?}"
+        );
+    }
+
+    #[test]
     fn live_lock_is_never_stolen_based_on_its_age() {
         let dir = tempfile::tempdir().unwrap();
         let store = JishukenStore::init(dir.path()).unwrap();
         let lock = store.lock().unwrap();
-        lock.set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+        lock.0
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
         assert!(JishukenStore::open(dir.path()).is_err());
         drop(lock);
