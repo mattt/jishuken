@@ -1,4 +1,5 @@
-//! `ken.toml` parsing (README "Configuration"). Lives in the store root.
+//! `ken.toml` parsing.
+//! Lives in the store root.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,7 @@ pub struct Config {
     pub daemon: Daemon,
     #[serde(default)]
     pub command: CommandCfg,
-    /// Named external source roots, read through their own VCS (README
-    /// "Configuration": `[sources.wiki]`).
+    /// Named external source roots, read through their own VCS.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sources: BTreeMap<String, SourceRootCfg>,
 }
@@ -60,10 +60,11 @@ fn detect_vcs(root: &Path) -> Vcs {
     }
 }
 
-/// A named source mount (README "Configuration"). Either repo-backed (`repo`,
-/// read through its VCS) or handler-backed (`handler`, a sandboxed Deno module
-/// that resolves a reference to bytes). The two are mutually exclusive: a CURIE
-/// prefix is one mount, resolved one way.
+/// A named source mount.
+/// Either repo-backed (`repo`, read through its VCS) or handler-backed
+/// (`handler`, a sandboxed Deno module that resolves a reference to bytes).
+/// The two are mutually exclusive: a CURIE prefix is one mount, resolved one
+/// way.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SourceRootCfg {
     /// Path to the repo, relative to the store root (e.g. `../wiki`).
@@ -121,7 +122,7 @@ pub struct Budget {
     pub per_tick: usize,
     /// Base audit rate, scaled up by a fact's centrality.
     pub epsilon: f64,
-    /// Max exploration-floor audits per tick (DESIGN §7), on top of `per_tick`.
+    /// Max exploration-floor audits per tick, on top of `per_tick`.
     #[serde(default = "default_audit_per_tick")]
     pub audit_per_tick: usize,
     /// Max concurrent ground reads in a tick's read phase. `1` is serial.

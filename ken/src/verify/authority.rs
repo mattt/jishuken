@@ -5,8 +5,8 @@ use super::ControlToken;
 use crate::schema::{Element, Epistemics, FactId, GeneratorHash, GroundBinding, Outcome, Resolved};
 use crate::write::WriteOp;
 
-/// Bind an independent ground source to a fact (`ken ground`). A privilege
-/// escalation, logged loudly (DESIGN §10).
+/// Bind an independent ground source to a fact (`ken ground`).
+/// A privilege escalation, logged loudly.
 pub fn ground(fact: FactId, binding: GroundBinding) -> WriteOp {
     WriteOp::Ground {
         fact,
@@ -15,8 +15,9 @@ pub fn ground(fact: FactId, binding: GroundBinding) -> WriteOp {
     }
 }
 
-/// Record the result of one ground check. The only path that can move
-/// `groundedness` (DESIGN §2, §3); a verifier is just the tier-3 case.
+/// Record the result of one ground check.
+/// The only path that can move `groundedness`; a verifier is just the tier-3
+/// case.
 pub fn ground_check(
     fact: FactId,
     ground: usize,
@@ -38,7 +39,8 @@ pub fn ground_check(
     }
 }
 
-/// Adjust scheduling priority. Never touches truth (DESIGN §3).
+/// Adjust scheduling priority.
+/// Never touches truth.
 pub fn reschedule(fact: FactId, new_priority: f64) -> WriteOp {
     WriteOp::Reschedule {
         fact,
@@ -47,7 +49,7 @@ pub fn reschedule(fact: FactId, new_priority: f64) -> WriteOp {
     }
 }
 
-/// Human override of belief, always logged loudly (DESIGN §3, §10).
+/// Human override of belief, always logged loudly.
 pub fn manual_override(fact: FactId, set: Epistemics, reason: String) -> WriteOp {
     WriteOp::ManualOverride {
         fact,

@@ -1,8 +1,8 @@
-//! Sybil-resistant, trust-weighted centrality (DESIGN §9). Katz centrality where
-//! each node's voting contribution is scaled by its own groundedness, so an
-//! ungrounded, freshly-ingested fact contributes nothing to importance until it
-//! clears its own verification. The control plane becomes robust to data-plane
-//! injection by construction.
+//! Sybil-resistant, trust-weighted centrality.
+//! Katz centrality where each node's voting contribution is scaled by its own
+//! groundedness, so an ungrounded, freshly-ingested fact contributes nothing to
+//! importance until it clears its own verification.
+//! The control plane becomes robust to data-plane injection by construction.
 
 use std::collections::HashMap;
 
@@ -13,7 +13,7 @@ pub struct FactGraph {
     nodes: Vec<String>,
     index: HashMap<String, usize>,
     edges: Vec<(usize, usize)>,
-    /// Per-node groundedness weight in `[0,1]` (DESIGN §9).
+    /// Per-node groundedness weight in `[0,1]`.
     weight: Vec<f64>,
 }
 

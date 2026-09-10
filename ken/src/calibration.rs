@@ -1,11 +1,13 @@
-//! Self-calibration (DESIGN §8). Every Confirmed/Refuted outcome logs a
-//! `(prior, grounded_outcome)` pair; the verification engine thereby produces
-//! the training signal to grade its own LLM triage. If the priors run hot, fit
-//! a 1-D Platt recalibration map and apply it to future ingests.
+//! Self-calibration.
+//! Every Confirmed/Refuted outcome logs a `(prior, grounded_outcome)` pair; the
+//! verification engine thereby produces the training signal to grade its own
+//! LLM triage.
+//! If the priors run hot, fit a 1-D Platt recalibration map and apply it to
+//! future ingests.
 
 use serde::{Deserialize, Serialize};
 
-/// A single training pair, produced only by a `GroundCheck` (DESIGN §8).
+/// A single training pair, produced only by a `GroundCheck`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CalibrationSample {
     pub prior: f64,
@@ -107,8 +109,8 @@ pub fn reliability_bins(samples: &[CalibrationSample], num_bins: usize) -> Vec<R
         .collect()
 }
 
-/// Fit a Platt map by gradient descent on log-loss. Needs a handful of samples;
-/// below that it returns the identity map (DESIGN §8: regenerable, refit freely).
+/// Fit a Platt map by gradient descent on log-loss.
+/// Returns the identity map until there are at least four samples.
 pub fn recalibrate(samples: &[CalibrationSample]) -> Recalibrator {
     if samples.len() < 4 {
         return Recalibrator::default();

@@ -1,11 +1,11 @@
-//! Staleness as covariance (DESIGN §5) and the Kalman update (DESIGN §8).
+//! Staleness as covariance and the Kalman update.
 //!
-//! Confidence is the scalar state estimate; variance is its covariance. Between
-//! verifications variance accrues as process noise `Q` per unit time (the
-//! predict step), so confidence relaxes toward maximal ignorance (0.5). On a
-//! Confirmed/Refuted outcome we do a confidence-weighted Bayesian update, with a
-//! network verifier's gain discounted because its channel is attacker-influenceable
-//! (DESIGN §6a point 2).
+//! Confidence is the scalar state estimate; variance is its covariance.
+//! Between verifications variance accrues as process noise `Q` per unit time
+//! (the predict step), so confidence relaxes toward maximal ignorance (0.5).
+//! On a Confirmed/Refuted outcome we do a confidence-weighted Bayesian update,
+//! with a network verifier's gain discounted because its channel is
+//! attacker-influenceable.
 
 use crate::config::Config;
 use crate::schema::{Fact, Timestamp, Volatility};
@@ -35,8 +35,9 @@ pub fn process_noise(v: Volatility, cfg: &Config) -> f64 {
     }
 }
 
-/// Confidence after decay (DESIGN §5). Relaxes toward [`IGNORANCE`] with the
-/// fact's volatility half-life; immutable facts do not decay.
+/// Confidence after decay.
+/// Relaxes toward [`IGNORANCE`] with the fact's volatility half-life; immutable
+/// facts do not decay.
 pub fn decayed_confidence(f: &Fact, now: Timestamp, cfg: &Config) -> f64 {
     let dt = (now - f.schedule.last_verified).num_seconds().max(0) as f64;
     let c0 = f.epistemics.confidence;
@@ -54,8 +55,9 @@ pub fn decayed_variance(f: &Fact, now: Timestamp, cfg: &Config) -> f64 {
 }
 
 /// Scalar Kalman update on a Confirmed (`true`) or Refuted (`false`) outcome.
-/// Returns the posterior `(confidence, variance)`. A net-entitled verifier
-/// carries more measurement noise, so it moves confidence less (DESIGN §6a).
+/// Returns the posterior `(confidence, variance)`.
+/// A net-entitled verifier carries more measurement noise, so it moves
+/// confidence less.
 pub fn kalman_update(
     prior_conf: f64,
     prior_var: f64,

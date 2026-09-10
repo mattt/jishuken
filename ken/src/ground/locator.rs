@@ -1,5 +1,6 @@
 //! Parse the README locator strings to a `(SourceRef, Locator)` and render them
-//! back for `why`/`recall`. Grammar (README "Sources and locators"):
+//! back for `why`/`recall`.
+//! Grammar:
 //!
 //! - `path`                      whole file
 //! - `path#heading`              Markdown section

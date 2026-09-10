@@ -1,7 +1,8 @@
-//! Jishuken (`ken`): self-verifying memory for agents. The store is a directory
-//! of fact files with an append-only op log. See `DESIGN.md` for the model and
-//! `README.md` for the surface. The trust spine is: schema → write authority →
-//! store → verifier → kalman → scheduler → centrality.
+//! Jishuken (`ken`): memory for agents with scheduled verification.
+//!
+//! The store holds fact files and an append-only operation log.
+//! See the [README](https://github.com/mattt/ken#readme) for usage,
+//! design, and security boundaries.
 
 pub mod calibration;
 pub mod centrality;

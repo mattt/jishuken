@@ -1,7 +1,7 @@
-//! The proactive, value-of-information scheduler (DESIGN §7). Rank facts by the
-//! expected value of checking them, spend a fixed budget per tick on the top-k,
-//! and keep a small exploration floor so a confidently-wrong belief cannot sit
-//! undisturbed forever.
+//! The proactive, value-of-information scheduler.
+//! Rank facts by the expected value of checking them, spend a fixed budget per
+//! tick on the top-k, and keep a small exploration floor so a confidently-wrong
+//! belief cannot sit undisturbed forever.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,8 +42,9 @@ fn min_check_cost(f: &Fact, costs: &CostTable) -> Option<f64> {
         .min_by(f64::total_cmp)
 }
 
-/// `voi = p_wrong * centrality / cost` (DESIGN §7). Cost is the cheapest ground
-/// check (tier-1/2 are cheap, tier-3 carries the measured or estimated cost).
+/// `voi = p_wrong * centrality / cost`.
+/// Cost is the cheapest ground check (tier-1/2 are cheap, tier-3 carries the
+/// measured or estimated cost).
 pub fn voi_score(f: &Fact, now: Timestamp, cfg: &Config, costs: &CostTable) -> f64 {
     let p_wrong = 1.0 - decayed_confidence(f, now, cfg);
     let consequence = f.schedule.centrality;
@@ -51,9 +52,9 @@ pub fn voi_score(f: &Fact, now: Timestamp, cfg: &Config, costs: &CostTable) -> f
     p_wrong * consequence / cost
 }
 
-/// Standing audit probability for a high-confidence fact, scaled by
-/// consequence so the exploration budget lands where wrong is expensive
-/// (DESIGN §7). Routed through an *independent* verifier by the caller.
+/// Standing audit probability for a high-confidence fact, scaled by consequence
+/// so the exploration budget lands where wrong is expensive.
+/// Routed through an *independent* verifier by the caller.
 pub fn audit_probability(f: &Fact, cfg: &Config) -> f64 {
     (cfg.budget.epsilon * f.schedule.centrality).clamp(0.0, 1.0)
 }
@@ -65,9 +66,10 @@ fn ground_identity(b: &GroundBinding) -> &str {
 }
 
 /// Whether a fact carries at least two grounds with *distinct* verifier
-/// identities. The exploration floor only audits these: re-running a fact's
-/// lone verifier is a self-confirming fixed point, so an audit needs an
-/// independent verifier to be worth anything (DESIGN §7).
+/// identities.
+/// The exploration floor only audits these: re-running a fact's lone verifier
+/// is a self-confirming fixed point, so an audit needs an independent verifier
+/// to be worth anything.
 pub fn has_independent_ground(f: &Fact) -> bool {
     let mut ids: HashSet<&str> = HashSet::new();
     for b in &f.grounds {
@@ -91,10 +93,11 @@ fn audit_draw(id: &str, now: Timestamp) -> f64 {
     f64::from(n) / f64::from(u32::MAX)
 }
 
-/// The exploration floor (DESIGN §7): high-consequence facts the `VoI` ranking
-/// would never re-examine, drawn with probability [`audit_probability`] and
-/// capped at `budget.audit_per_tick`. Excludes facts already in `selected` and
-/// any without an independent ground to audit through.
+/// The exploration floor: high-consequence facts the `VoI` ranking would never
+/// re-examine, drawn with probability [`audit_probability`] and capped at
+/// `budget.audit_per_tick`.
+/// Excludes facts already in `selected` and any without an independent ground
+/// to audit through.
 pub fn select_audits<'a>(
     facts: &'a [Fact],
     now: Timestamp,
@@ -129,8 +132,8 @@ pub fn rank<'a>(
     scored.into_iter().map(|(f, _)| f).collect()
 }
 
-/// The top-`per_tick` facts to check this tick (DESIGN §7). Facts with no
-/// grounds are skipped — there is nothing to spend the budget on.
+/// The top-`per_tick` facts to check this tick.
+/// Facts with no grounds are skipped — there is nothing to spend the budget on.
 pub fn select_tick<'a>(
     facts: &'a [Fact],
     now: Timestamp,

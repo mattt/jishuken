@@ -1,6 +1,6 @@
 //! Ground sources: the typed reference (source + locator) a fact is checked
-//! against, and the resolver that reduces it to a hashed span (README "Sources
-//! and locators"). The verifier judges that span; the locator addresses it.
+//! against, and the resolver that reduces it to a hashed span.
+//! The verifier judges that span; the locator addresses it.
 
 pub mod generator;
 pub mod locator;

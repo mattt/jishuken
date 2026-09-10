@@ -1,8 +1,9 @@
 //! The control-plane engine: read a fact's grounds, judge each with its pure
-//! predicate (DESIGN §6; README "Sources and predicates"), and apply the
-//! resulting `GroundCheck` ops. Reading (File/Command/Generator) lives in
-//! `ground::resolve`; judging is a pure `Predicate`. This is the only caller of
-//! `verify::authority` in normal operation; the data plane (MCP) never reaches it.
+//! predicate, and apply the resulting `GroundCheck` ops.
+//! Reading (File/Command/Generator) lives in `ground::resolve`; judging is a
+//! pure `Predicate`.
+//! This is the only caller of `verify::authority` in normal operation; the data
+//! plane (MCP) never reaches it.
 
 use chrono::Utc;
 
@@ -53,11 +54,12 @@ fn verify_fact_inner(store: &KenStore, key: &str, recompute: bool) -> Result<Gro
     Ok(store.read_fact_by_key(key)?.epistemics.groundedness)
 }
 
-/// Audit a confident fact through its *independent* grounds (DESIGN §7): re-check
-/// only the grounds whose verifier differs from the incumbent that last verified
-/// the fact, so an audit is a differential check, never the incumbent
-/// re-confirming itself. Falls back to all grounds when there is no clear
-/// incumbent. Disagreement surfaces as `Conflicted` via `aggregate_groundedness`.
+/// Audit a confident fact through its *independent* grounds: re-check only the
+/// grounds whose verifier differs from the incumbent that last verified the
+/// fact, so an audit is a differential check, never the incumbent re-confirming
+/// itself.
+/// Falls back to all grounds when there is no clear incumbent.
+/// Disagreement surfaces as `Conflicted` via `aggregate_groundedness`.
 ///
 /// # Errors
 /// Returns an error if the fact is unknown, has no grounds, or a store read or
@@ -188,9 +190,9 @@ pub fn check_ground(store: &KenStore, fact: &Fact, idx: usize) -> Result<GroundO
 }
 
 /// Diff a returned ground-truth set (the resolved span, a JSON array) against
-/// the stored elements (DESIGN §1, §8). Per-element so confirming the list does
-/// not smear credit. `None` if the fact is not a set or the span is not a JSON
-/// array.
+/// the stored elements.
+/// Per-element so confirming the list does not smear credit.
+/// `None` if the fact is not a set or the span is not a JSON array.
 fn diff_set(value: &FactValue, span: &str) -> Option<Vec<Element>> {
     let FactValue::Set { elements } = value else {
         return None;
@@ -257,7 +259,7 @@ pub fn ground(store: &KenStore, key: &str, binding: GroundBinding) -> Result<Gro
 }
 
 /// Entitle a generator with new capabilities (`ken grant`). Re-registers the
-/// source (changing its content hash, DESIGN §6a) and re-points the Generator
+/// source (changing its content hash) and re-points the Generator
 /// grounds that use it.
 ///
 /// # Errors
@@ -363,12 +365,13 @@ fn run_check_phase(
     collected.into_iter().map(|(_, r)| r).collect()
 }
 
-/// One scheduler tick (DESIGN §7): check the top `VoI` facts under budget, plus
-/// an exploration-floor audit of confident high-consequence facts through their
-/// independent grounds. Reads fan out under `budget.concurrency`; the resulting
-/// ops are applied serially (the store lock is the write-serialization point) and centrality
-/// is recomputed once for the whole tick (Idea 1). Returns the keys checked and
-/// their resulting groundedness.
+/// One scheduler tick: check the top `VoI` facts under budget, plus an
+/// exploration-floor audit of confident high-consequence facts through their
+/// independent grounds.
+/// Reads fan out under `budget.concurrency`; the resulting ops are applied
+/// serially (the store lock is the write-serialization point) and centrality is
+/// recomputed once for the whole tick (Idea 1).
+/// Returns the keys checked and their resulting groundedness.
 ///
 /// # Errors
 /// Returns an error if listing the store's facts or a check/apply fails.

@@ -1,5 +1,6 @@
-//! Write authority (DESIGN §3). Every mutation is one [`WriteOp`] and becomes
-//! one op-log record, tagged in the description so the invariant is auditable.
+//! Write authority.
+//! Every mutation is one [`WriteOp`] and becomes one op-log record, tagged in
+//! the description so the invariant is auditable.
 //!
 //! The control-plane constructors live in [`crate::verify::authority`] and
 //! require a [`ControlToken`], whose only field is private to that module.
@@ -58,17 +59,20 @@ pub enum WriteOp {
         draft_ground: Option<GroundBinding>,
     },
 
-    /// Control plane. Bind an independent ground source to a fact (`ken ground`).
-    /// A privilege escalation, logged loudly (DESIGN §10).
+    /// Control plane.
+    /// Bind an independent ground source to a fact (`ken ground`).
+    /// A privilege escalation, logged loudly.
     Ground {
         fact: FactId,
         binding: GroundBinding,
         _auth: ControlToken,
     },
 
-    /// Control plane. Record the result of one ground check. The only path that
-    /// can move `groundedness` (DESIGN §2, §3). `by` is the generator hash for a
-    /// `Generator` source, else `None`/a synthetic marker.
+    /// Control plane.
+    /// Record the result of one ground check.
+    /// The only path that can move `groundedness`.
+    /// `by` is the generator hash for a `Generator` source, else `None`/a
+    /// synthetic marker.
     GroundCheck {
         fact: FactId,
         ground: usize,
@@ -79,7 +83,8 @@ pub enum WriteOp {
         /// returned set. `None` for scalar facts.
         set_update: Option<Vec<Element>>,
         /// Wall-clock seconds the read took, folded into the generator's cost
-        /// sketch (DESIGN §7, Idea 2). `None` when there is nothing to measure.
+        /// sketch.
+        /// `None` when there is nothing to measure.
         observed_cost: Option<f64>,
         _auth: ControlToken,
     },
@@ -146,10 +151,10 @@ pub fn landed_confidence(triage: &TriageSource) -> f64 {
     landed_confidence_with(triage, &Recalibrator::default())
 }
 
-/// [`landed_confidence`] with a fitted recalibration map (DESIGN §8) applied to
-/// LLM-triaged priors before the ceiling clamp. Grades the triage, never the
-/// ground truth: bare ingests and manual triage are not LLM claims, so the map
-/// does not touch them.
+/// [`landed_confidence`] with a fitted recalibration map applied to LLM-triaged
+/// priors before the ceiling clamp.
+/// Grades the triage, never the ground truth: bare ingests and manual triage
+/// are not LLM claims, so the map does not touch them.
 pub fn landed_confidence_with(triage: &TriageSource, recalibrator: &Recalibrator) -> f64 {
     let requested = match triage {
         TriageSource::Llm { meta_confidence } => recalibrator.apply(*meta_confidence),
