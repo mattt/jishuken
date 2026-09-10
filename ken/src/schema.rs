@@ -1,4 +1,5 @@
-//! Fact schema (DESIGN §1, §2). Normalized join keys, denormalized payload.
+//! Fact schema.
+//! Normalized join keys, denormalized payload.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -28,8 +29,8 @@ impl std::fmt::Display for FactId {
     }
 }
 
-/// Canonical node identity. Never a string recurring in many blobs; the
-/// scheduler traverses these (DESIGN §1).
+/// Canonical node identity.
+/// Never a string recurring in many blobs; the scheduler traverses these.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EntityId(pub String);
 
@@ -108,8 +109,9 @@ impl FactValue {
     }
 }
 
-/// An assertion: the atomic proposition. Carries its own epistemics only when
-/// it earns them, so gain and conflict land per element (DESIGN §1).
+/// An assertion: the atomic proposition.
+/// Carries its own epistemics only when it earns them, so gain and conflict
+/// land per element.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Element {
     pub value: serde_json::Value,
@@ -125,7 +127,7 @@ pub struct ConflictMarker {
     pub verifiers: Vec<GeneratorHash>,
 }
 
-/// Confidence and groundedness must never merge (DESIGN §2).
+/// Confidence and groundedness must never merge.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Epistemics {
     pub confidence: f64,
@@ -135,17 +137,22 @@ pub struct Epistemics {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "lowercase")]
 pub enum Groundedness {
+    /// An ingested or manually doubted claim.
     Ungrounded { source: TriageSource },
+    /// The checked grounds confirm the claim, with no refutations.
     Verified { at: Timestamp, by: GeneratorHash },
+    /// The checked grounds refute the claim, with no confirmations.
+    Refuted { at: Timestamp, by: GeneratorHash },
+    /// Some checked grounds confirm the claim and others refute it.
     Conflicted { verifiers: Vec<GeneratorHash> },
 }
 
 impl Groundedness {
-    /// Sybil-resistant centrality weight (DESIGN §9): ungrounded contributes
-    /// zero, conflicted contributes partial, verified contributes full.
+    /// Sybil-resistant centrality weight: ungrounded and refuted contribute zero,
+    /// conflicted contributes partial, verified contributes full.
     pub fn trust_weight(&self) -> f64 {
         match self {
-            Groundedness::Ungrounded { .. } => 0.0,
+            Groundedness::Ungrounded { .. } | Groundedness::Refuted { .. } => 0.0,
             Groundedness::Conflicted { .. } => 0.5,
             Groundedness::Verified { .. } => 1.0,
         }
@@ -155,6 +162,7 @@ impl Groundedness {
         match self {
             Groundedness::Ungrounded { .. } => "ungrounded",
             Groundedness::Verified { .. } => "verified",
+            Groundedness::Refuted { .. } => "refuted",
             Groundedness::Conflicted { .. } => "conflicted",
         }
     }
@@ -168,7 +176,7 @@ pub enum TriageSource {
     Manual,
 }
 
-/// Volatility class sets the process noise Q (DESIGN §5).
+/// Volatility class sets the process noise Q.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Volatility {
@@ -214,8 +222,9 @@ impl std::fmt::Display for GeneratorHash {
 }
 
 /// A content-addressed source generator: sandboxed code that emits the ground
-/// value. The capability set lives inside the hash (DESIGN §6a), so a generator
-/// that quietly starts asking for the network produces a loud diff and a grant.
+/// value.
+/// The capability set lives inside the hash, so a generator that quietly starts
+/// asking for the network produces a loud diff and a grant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeneratorRef {
     pub hash: GeneratorHash,
@@ -242,9 +251,9 @@ impl GeneratorRef {
 
 /// A content-addressed scheme handler: sandboxed code mounted under a CURIE
 /// prefix (`[sources.<scheme>]` with a `handler`) that resolves a reference to
-/// document bytes. Like a generator, its capability set lives inside the hash
-/// (DESIGN §6a), so a handler that quietly starts asking for the network
-/// produces a loud diff and a re-ground.
+/// document bytes.
+/// Like a generator, its capability set lives inside the hash, so a handler
+/// that starts asking for the network produces a loud diff and a re-ground.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HandlerRef {
     pub hash: GeneratorHash,
@@ -297,8 +306,9 @@ pub struct Provenance {
     pub ingested_at: Timestamp,
 }
 
-/// Result of a ground check against a ground source (DESIGN §6). Lives here
-/// because both the write path and a ground binding's recorded state need it.
+/// Result of a ground check against a ground source.
+/// Lives here because both the write path and a ground binding's recorded state
+/// need it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
@@ -322,14 +332,14 @@ impl Outcome {
         }
     }
 
-    /// Only confirmed/refuted move confidence and feed calibration (DESIGN §6, §8).
+    /// Only confirmed/refuted move confidence and feed calibration.
     pub fn updates_belief(&self) -> bool {
         matches!(self, Outcome::Confirmed | Outcome::Refuted)
     }
 }
 
-/// Where a source root resolves. `Named` roots come from `[sources.*]`
-/// (README "Configuration").
+/// Where a source root resolves.
+/// `Named` roots come from `[sources.*]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceRoot {
@@ -342,7 +352,7 @@ pub enum SourceRoot {
 }
 
 /// A typed reference to where a truth lives: a root, a path within it, and an
-/// optional pinned revision (README "Sources and locators").
+/// optional pinned revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRef {
     pub root: SourceRoot,
@@ -375,14 +385,15 @@ pub enum GroundSource {
     Command(CommandSource),
     Generator(GeneratorRef),
     /// A scheme handler mounted under a CURIE prefix: code that resolves a
-    /// reference to bytes, which the locator then projects (README "Sources").
+    /// reference to bytes, which the locator then projects.
     Handler(HandlerSource),
 }
 
-/// Channel trust weights (DESIGN §6a point 2): how much a confirmation read over
-/// each channel counts. A local file read is deterministic and un-eclipse-able
-/// (full weight); a command or net-capable generator is attacker-influenceable,
-/// so its gain is discounted.
+/// Channel trust weights: how much a confirmation read over each channel
+/// counts.
+/// A local file read is deterministic and un-eclipse-able (full weight); a
+/// command or net-capable generator is attacker-influenceable, so its gain is
+/// discounted.
 const WEIGHT_FILE: f64 = 1.0;
 const WEIGHT_COMMAND: f64 = 0.7;
 const WEIGHT_NET: f64 = 0.5;
@@ -403,9 +414,9 @@ fn weight_for_net(is_net: bool) -> f64 {
 }
 
 impl GroundSource {
-    /// Trust weight of the channel (DESIGN §6a point 2): a local file read is
-    /// deterministic and un-eclipse-able, so it counts full; a command or a
-    /// net-capable generator is more eclipse-able, so it discounts the gain.
+    /// Trust weight of the channel: a local file read is deterministic and
+    /// un-eclipse-able, so it counts full; a command or a net-capable generator
+    /// is more eclipse-able, so it discounts the gain.
     pub fn channel_weight(&self) -> f64 {
         match self {
             GroundSource::File(_) => WEIGHT_FILE,
@@ -442,13 +453,14 @@ impl GroundSource {
             GroundSource::File(_) => "FILE".to_string(),
             GroundSource::Command(_) => "CMD".to_string(),
             GroundSource::Generator(_) => "GEN".to_string(),
-            // The mount's scheme, uppercased (e.g. `WIKI`), per the README mock.
+            // The mount's scheme, uppercased (e.g.
+            // `WIKI`).
             GroundSource::Handler(h) => h.handler.scheme.to_uppercase(),
         }
     }
 }
 
-/// Points at the span within a source the fact is about (README locator table).
+/// Points at the span within a source the fact is about.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "loc", rename_all = "lowercase")]
 pub enum Locator {
@@ -464,8 +476,8 @@ pub enum Locator {
     Whole,
 }
 
-/// The state a ground check last resolved to: the replay binding (DESIGN §6,
-/// THREAT-MODEL D). A confirmation is bound to the exact span it saw.
+/// The state a ground check last resolved to: the replay binding.
+/// A confirmation is bound to the exact span it saw.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Resolved {
     pub rev: String,
@@ -509,15 +521,15 @@ pub struct Fact {
     pub value: FactValue,
     pub epistemics: Epistemics,
     pub schedule: ScheduleMeta,
-    /// Independent groundings of the same proposition (DESIGN §1). Empty until
-    /// the control plane binds one.
+    /// Independent groundings of the same proposition.
+    /// Empty until the control plane binds one.
     #[serde(default)]
     pub grounds: Vec<GroundBinding>,
     pub provenance: Provenance,
 }
 
 impl Fact {
-    /// Deterministic on-disk path: `facts/<entity>/<relation>.json` (DESIGN §4).
+    /// Deterministic on-disk path: `facts/<entity>/<relation>.json`.
     pub fn rel_path(&self) -> String {
         path_for(&self.claim)
     }
@@ -601,7 +613,12 @@ mod tests {
             by: GeneratorHash("x".into()),
         };
         let c = Groundedness::Conflicted { verifiers: vec![] };
+        let r = Groundedness::Refuted {
+            at: ts,
+            by: GeneratorHash("x".into()),
+        };
         assert_eq!(u.trust_weight(), 0.0);
+        assert_eq!(r.trust_weight(), 0.0);
         assert_eq!(c.trust_weight(), 0.5);
         assert_eq!(v.trust_weight(), 1.0);
     }

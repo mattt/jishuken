@@ -38,17 +38,17 @@ use rmcp::{
 };
 use serde_json::{json, Value};
 
-/// What every connecting agent is told about the store before it acts. The
-/// epistemics discipline (DESIGN §2) and the trust boundary (§3) made legible.
+/// What every connecting agent is told about the store before it acts.
+/// The epistemics discipline and the trust boundary made legible.
 const INSTRUCTIONS: &str = "\
 ken is self-verifying memory. Every fact carries two signals you must read before \
 you trust it, and they never collapse into one: `confidence` is how much to believe \
 it (it decays with time), and `groundedness` is whether it was ever checked against \
 a real source. An `ungrounded` fact is an LLM guess or raw ingest, so a high \
-confidence on an ungrounded fact is still a guess, not a checked truth. Only \
-`verified` facts were confirmed against a ground source; `conflicted` facts hold two \
-answers that disagree. Treat the value alone as unreliable until you have read its \
-groundedness.
+confidence on an ungrounded fact is still a guess. `verified` means its checked \
+grounds confirm the claim; `refuted` means they reject it. A `conflicted` fact has \
+both confirming and refuting grounds. Do not rely on a refuted value. Read the \
+ground outcomes and timestamps as well as the status.
 
 This is ken's data plane. You can recall, search, and ingest, and browse facts as \
 resources. You cannot verify, ground, override belief, or grant capabilities here, \
@@ -99,7 +99,7 @@ pub struct SearchParams {
     query: String,
     entity: Option<String>,
     relation: Option<String>,
-    /// ungrounded | verified | conflicted
+    /// ungrounded | verified | refuted | conflicted
     grounded: Option<String>,
 }
 
@@ -117,7 +117,7 @@ pub struct RecallOutput {
     groundedness: GroundednessOut,
     /// Independent groundings bound to this fact.
     grounds: Vec<GroundOut>,
-    /// When the fact was last verified (RFC 3339).
+    /// When the fact was last confirmed or refuted (RFC 3339).
     last_verified: String,
     /// When it next falls due for a re-check (RFC 3339); absent if it never decays.
     due: Option<String>,
@@ -125,12 +125,12 @@ pub struct RecallOutput {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 struct GroundednessOut {
-    /// `ungrounded` (never checked, treat as a guess), `verified`, or `conflicted`.
+    /// `ungrounded` (a guess), `verified` (confirmed), `refuted`, or `conflicted`.
     state: String,
-    /// The verifier that confirmed it, when `verified`.
+    /// The verifier that confirmed or refuted it.
     #[serde(skip_serializing_if = "Option::is_none")]
     verifier: Option<String>,
-    /// When it was verified (RFC 3339).
+    /// When it was confirmed or refuted (RFC 3339).
     #[serde(skip_serializing_if = "Option::is_none")]
     at: Option<String>,
     /// The disagreeing verifiers, when `conflicted`.
@@ -199,9 +199,10 @@ impl KenServer {
             },
             None => TriageSource::Ingest,
         };
-        // `ground` is a hint: a draft binding with the default Exists predicate.
-        // Naming a source is not grounding against it (DESIGN §3); the fact
-        // stays ungrounded until the control plane checks it.
+        // `ground` is a hint: a draft binding with the default Exists
+        // predicate.
+        // Naming a source is not grounding against it; the fact stays
+        // ungrounded until the control plane checks it.
         let draft_ground = match p.ground.as_deref() {
             Some(s) => {
                 let (src, locator) = parse_source(s, None).map_err(|e| e.to_string())?;
@@ -383,9 +384,10 @@ fn conflicts_value(store: &KenStore) -> Result<Value, String> {
     Ok(json!({ "conflicts": conflicts, "distrusted": distrusted }))
 }
 
-/// Facts ranked by value of information (DESIGN §7): the ones most likely to be
-/// both wrong and consequential. A read-only window onto what the scheduler
-/// would check next, so an agent can distrust the memories that are due.
+/// Facts ranked by value of information: the ones most likely to be both wrong
+/// and consequential.
+/// A read-only window onto what the scheduler would check next, so an agent can
+/// distrust the memories that are due.
 fn stale_value(store: &KenStore) -> Result<Value, String> {
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
@@ -453,8 +455,8 @@ fn groundedness_out(g: &Groundedness) -> GroundednessOut {
             at: None,
             verifiers: None,
         },
-        Groundedness::Verified { at, by } => GroundednessOut {
-            state: "verified".to_string(),
+        Groundedness::Verified { at, by } | Groundedness::Refuted { at, by } => GroundednessOut {
+            state: g.label().to_string(),
             verifier: Some(by.0.clone()),
             at: Some(at.to_rfc3339()),
             verifiers: None,
@@ -615,8 +617,9 @@ fn prompt_messages(
                  find related facts, then `ken_recall` (or the `ken://fact/...` resource) for \
                  each one that matters. Weigh every value by its epistemics, not its text: an \
                  ungrounded fact is a guess regardless of confidence, a verified fact was \
-                 checked against a real source, and a conflicted fact holds two answers, so \
-                 surface the disagreement rather than picking one. Prefer recently verified, \
+                 confirmed against a real source, and a refuted fact was rejected by its \
+                 checked grounds. Do not rely on a refuted value. A conflicted fact has \
+                 both confirming and refuting grounds; surface that disagreement. Prefer recently verified, \
                  high-confidence facts; treat stale or ungrounded ones as leads to confirm, \
                  not as settled truth. If you confirm against a live source that a stored \
                  value has changed, re-ingest the corrected value with a ground hint so the \
@@ -907,6 +910,35 @@ mod tests {
             "auth.handler",
             "store:src.txt?q=\"moved elsewhere\"",
         );
+
+        let recalled = server
+            .ken_recall(Parameters(RecallParams {
+                key: "checkout.v2_enabled".to_string(),
+            }))
+            .unwrap();
+        assert_eq!(recalled.0.groundedness.state, "refuted");
+        assert!(recalled.0.groundedness.at.is_some());
+        assert!(recalled.0.groundedness.verifier.is_some());
+        assert_eq!(
+            recalled.0.grounds[0].last_outcome.as_deref(),
+            Some("refuted")
+        );
+
+        let result = server
+            .ken_search(Parameters(SearchParams {
+                query: String::new(),
+                entity: None,
+                relation: None,
+                grounded: Some("refuted".into()),
+            }))
+            .unwrap();
+        let output = serde_json::to_value(result).unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(output["content"][0]["text"].as_str().unwrap()).unwrap();
+        let hits = payload["matches"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["key"], "checkout.v2_enabled");
+        assert_eq!(hits[0]["groundedness"], "refuted");
 
         let conflicts = server.ken_conflicts().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&conflicts).unwrap();

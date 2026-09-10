@@ -1,7 +1,7 @@
-//! The `ken` CLI (README "CLI"). Two planes: a data plane (`add`, `recall`,
-//! `init`, `search`) any caller may touch, and a control plane (`ground`,
-//! `verify`, `doubt`, `grant`) where truth is asserted and privileges granted,
-//! logged loudly.
+//! The `ken` CLI.
+//! Two planes: a data plane (`add`, `recall`, `init`, `search`) any caller may
+//! touch, and a control plane (`ground`, `verify`, `doubt`, `grant`) where
+//! truth is asserted and privileges granted, logged loudly.
 
 mod mcp;
 
@@ -156,7 +156,7 @@ struct SearchArgs {
     entity: Option<String>,
     #[arg(long)]
     relation: Option<String>,
-    /// Filter by groundedness: ungrounded | verified | conflicted.
+    /// Filter by groundedness: ungrounded | verified | refuted | conflicted.
     #[arg(long)]
     grounded: Option<String>,
     /// Only facts already due for re-check.
@@ -476,7 +476,16 @@ fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
             println!(
                 "  grounded     verified {} · {}",
                 relative(*at, now),
-                confirming_ground(&fact).unwrap_or_else(|| "existence".to_string())
+                latest_ground(&fact, ken::schema::Outcome::Confirmed)
+                    .unwrap_or_else(|| "existence".to_string())
+            );
+        }
+        Groundedness::Refuted { at, .. } => {
+            println!(
+                "  grounded     refuted {} · {}",
+                relative(*at, now),
+                latest_ground(&fact, ken::schema::Outcome::Refuted)
+                    .unwrap_or_else(|| "existence".to_string())
             );
         }
         Groundedness::Conflicted { verifiers } => {
@@ -890,8 +899,8 @@ fn groundedness_json(g: &Groundedness) -> serde_json::Value {
             "state": "ungrounded",
             "source": source,
         }),
-        Groundedness::Verified { at, by } => serde_json::json!({
-            "state": "verified",
+        Groundedness::Verified { at, by } | Groundedness::Refuted { at, by } => serde_json::json!({
+            "state": g.label(),
             "at": at,
             "verifier": by.0,
         }),
@@ -923,15 +932,11 @@ fn grounds_json(fact: &Fact) -> serde_json::Value {
     serde_json::Value::Array(arr)
 }
 
-/// The display of whichever ground last confirmed the fact, for the recall line.
-fn confirming_ground(fact: &Fact) -> Option<String> {
+/// The latest ground with the requested outcome, for the recall line.
+fn latest_ground(fact: &Fact, outcome: ken::schema::Outcome) -> Option<String> {
     fact.grounds
         .iter()
-        .filter(|g| {
-            g.last
-                .as_ref()
-                .is_some_and(|r| r.outcome == ken::schema::Outcome::Confirmed)
-        })
+        .filter(|g| g.last.as_ref().is_some_and(|r| r.outcome == outcome))
         .max_by(|a, b| {
             a.last
                 .as_ref()

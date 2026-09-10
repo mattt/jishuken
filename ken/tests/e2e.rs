@@ -72,7 +72,7 @@ fn init_add_recall_roundtrip() {
 
     let fact = store.read_fact_by_key("staging.url").unwrap();
     assert_eq!(fact.value.render(), "https://stg.example.com");
-    // Data-plane ingest always lands Ungrounded (DESIGN §2, §3).
+    // Data-plane ingest always lands Ungrounded.
     assert!(matches!(
         fact.epistemics.groundedness,
         Groundedness::Ungrounded { .. }
@@ -197,6 +197,12 @@ fn two_independent_grounds_disagree_conflict() {
     );
     let conflicts = store.list_conflicts().unwrap();
     assert!(conflicts.iter().any(|id| id.0 == "auth.handler"));
+
+    // Once neither quote resolves, both grounds refute the claim.
+    std::fs::write(store.root().join("src.txt"), "neither quote is present").unwrap();
+    let g = engine::verify_fact(&store, "auth.handler").unwrap();
+    assert!(matches!(g, Groundedness::Refuted { .. }));
+    assert!(store.list_conflicts().unwrap().is_empty());
 }
 
 /// A scheduler tick checks grounded, due facts, and coalesces the centrality
@@ -266,9 +272,10 @@ fn concurrent_tick_checks_all_and_coalesces_centrality() {
     );
 }
 
-/// The exploration floor (DESIGN §7): an audit re-checks a confident fact
-/// through its independent grounds. When one ground drifts to disagree, the
-/// audit surfaces it as Conflicted, never letting the incumbent re-confirm itself.
+/// The exploration floor: an audit re-checks a confident fact through its
+/// independent grounds.
+/// When one ground drifts to disagree, the audit surfaces it as Conflicted,
+/// never letting the incumbent re-confirm itself.
 #[test]
 fn audit_through_independent_ground_flips_to_conflicted() {
     let (_dir, store) = fresh_store();
@@ -318,8 +325,9 @@ fn predicate_contains_judges_span() {
     ingest(&store, "svc.other", "9999", Volatility::Days);
     let g = ground_file(&store, "svc.other", "store:cfg.txt", "contains");
     let f = store.read_fact_by_key("svc.other").unwrap();
-    assert!(matches!(g, Groundedness::Verified { .. })); // checked
-    assert!(f.epistemics.confidence < 0.5); // ...but refuted, so confidence fell
+    assert!(matches!(g, Groundedness::Refuted { .. }));
+    assert_eq!(f.epistemics.groundedness, g);
+    assert!(f.epistemics.confidence < 0.5);
 }
 
 /// A `Command` source whose argv[0] is not in the allowlist is refused (errored,
@@ -434,6 +442,44 @@ fn cli_ground_verify_recall_roundtrip() {
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["value"], "8080");
     assert_eq!(parsed["groundedness"]["state"], "verified");
+
+    // The source changes without the stored claim changing.
+    std::fs::write(store.root().join("cfg.txt"), "port = 9090").unwrap();
+    let out = ken_cli(&store, &["verify", "svc.port"]);
+    assert!(
+        out.contains("refuted"),
+        "changed source should refute: {out}"
+    );
+    let out = ken_cli(&store, &["recall", "svc.port"]);
+    assert!(
+        out.contains("grounded     refuted"),
+        "recall should show refutation: {out}"
+    );
+    let out = ken_cli(&store, &["recall", "svc.port", "--json"]);
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["value"], "8080");
+    assert_eq!(parsed["groundedness"]["state"], "refuted");
+    assert!(parsed["groundedness"]["at"].is_string());
+    assert!(parsed["groundedness"]["verifier"].is_string());
+    let out = ken_cli(&store, &["search", "--grounded", "refuted", "--json"]);
+    let hits: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(hits["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(hits["matches"][0]["key"], "svc.port");
+    assert_eq!(hits["matches"][0]["groundedness"]["state"], "refuted");
+
+    // Failed reads retain the previous refutation without refreshing evidence.
+    let before = store.read_fact_by_key("svc.port").unwrap();
+    std::fs::remove_file(store.root().join("cfg.txt")).unwrap();
+    engine::verify_fact(&store, "svc.port").unwrap();
+    let after = store.read_fact_by_key("svc.port").unwrap();
+    assert_eq!(after.epistemics, before.epistemics);
+    assert_eq!(after.schedule.last_verified, before.schedule.last_verified);
+    assert_eq!(after.grounds, before.grounds);
+
+    // A later confirmation restores the verified state through a ground check.
+    std::fs::write(store.root().join("cfg.txt"), "port = 8080").unwrap();
+    let g = engine::verify_fact(&store, "svc.port").unwrap();
+    assert!(matches!(g, Groundedness::Verified { .. }));
 }
 
 /// `ken tick` over the binary checks due grounded facts and reports outcomes.

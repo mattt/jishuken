@@ -1,9 +1,11 @@
-//! The storage seam (DESIGN §4). A fact is a file at
-//! `facts/<entity>/<relation>.json`, so the store greps and diffs like code.
+//! Fact files and operation history.
+//! A fact is a file at `facts/<entity>/<relation>.json`, so the store greps and
+//! diffs like code.
 //! Every [`WriteOp`] lands as one tagged record in an append-only op log
 //! (`ops.jsonl`) that `ken` owns: the log is the audit, the fact files are the
-//! working state, and `undo` replays a record's saved bytes in reverse. Writes
-//! serialize behind a store lock; single-writer is the supported posture.
+//! working state, and `undo` replays a record's saved bytes in reverse.
+//! Writes serialize behind a store lock; single-writer is the supported
+//! posture.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -421,10 +423,11 @@ impl KenStore {
             .collect())
     }
 
-    /// Recompute trust-weighted centrality (DESIGN §9) over a fact→entity graph:
-    /// an entity is central in proportion to the *grounded* facts that touch it,
-    /// and each fact inherits the centrality of its entity. Ungrounded facts
-    /// contribute zero, so data-plane injection cannot inflate the budget.
+    /// Recompute trust-weighted centrality over a fact→entity graph: an entity
+    /// is central in proportion to the *grounded* facts that touch it, and each
+    /// fact inherits the centrality of its entity.
+    /// Ungrounded facts contribute zero, so data-plane injection cannot inflate
+    /// the budget.
     ///
     /// Returns `true` if any fact's centrality changed (and was rewritten), so
     /// callers that coalesce the recompute can skip an empty commit.
@@ -491,7 +494,7 @@ impl KenStore {
             } => {
                 let now = Utc::now();
                 let id = FactId::for_claim(&claim);
-                // DESIGN §8: grade the LLM triage that produced this prior. The
+                // Calibrate the LLM triage that produced this prior. The
                 // Platt map fitted from logged (prior, outcome) pairs is applied
                 // to LLM-triaged confidence; identity until enough samples.
                 let recalibrator = crate::calibration::recalibrate(&self.calibration_samples()?);
@@ -584,7 +587,7 @@ impl KenStore {
                     self.record_cost(h, secs)?;
                 }
                 // Recompute groundedness from ALL grounds: independent grounds
-                // that split between confirm and refute -> Conflicted (DESIGN §7).
+                // that split between confirm and refute -> Conflicted.
                 fact.epistemics.groundedness = aggregate_groundedness(&fact);
 
                 self.write_fact(&fact)?;
@@ -675,11 +678,13 @@ impl Drop for LockGuard {
     }
 }
 
-/// Recompute a fact's groundedness from all its grounds (DESIGN §7, §9). A
-/// ground that last confirmed or refuted counts as "checked"; if independent
+/// Recompute a fact's groundedness from all its grounds.
+/// A ground that last confirmed or refuted counts as "checked"; if independent
 /// grounds split between confirm and refute, the fact holds two answers and is
-/// `Conflicted`. With no checked ground it stays `Ungrounded` (preserving the
-/// ingest triage source).
+/// `Conflicted`.
+/// If all checked grounds refute the claim, it is `Refuted`.
+/// With no checked ground it stays `Ungrounded` (preserving the ingest triage
+/// source).
 fn aggregate_groundedness(fact: &Fact) -> Groundedness {
     let placeholder = || GeneratorHash("existence".to_string());
     let mut any_confirm = false;
@@ -716,7 +721,11 @@ fn aggregate_groundedness(fact: &Fact) -> Groundedness {
         },
         _ => {
             let (at, by) = latest.unwrap_or_else(|| (Utc::now(), placeholder()));
-            Groundedness::Verified { at, by }
+            if any_confirm {
+                Groundedness::Verified { at, by }
+            } else {
+                Groundedness::Refuted { at, by }
+            }
         }
     }
 }
@@ -733,8 +742,8 @@ mod tests {
     use crate::ground::locator::parse_source;
     use crate::predicate::Predicate;
     use crate::schema::{
-        Claim, Fact, FactValue, GroundBinding, GroundSource, Groundedness, Resolved, TriageSource,
-        Volatility,
+        Claim, Fact, FactValue, GeneratorHash, GroundBinding, GroundSource, Groundedness, Resolved,
+        TriageSource, Volatility,
     };
     use crate::test_support::verified_scalar;
     use crate::write::{Outcome, WriteOp};
@@ -846,6 +855,32 @@ mod tests {
             aggregate_groundedness(&fact),
             Groundedness::Verified { .. }
         ));
+    }
+
+    #[test]
+    fn refuted_grounds_preserve_the_latest_check_identity() {
+        let mut latest = ground_with(Some(Outcome::Refuted));
+        let at = Utc::now();
+        let by = GeneratorHash("refuting-verifier".into());
+        let check = latest.last.as_mut().unwrap();
+        check.at = at;
+        check.by = Some(by.clone());
+        let mut older = latest.clone();
+        older.last.as_mut().unwrap().at = at - chrono::Duration::seconds(1);
+        older.last.as_mut().unwrap().by = Some(GeneratorHash("older-verifier".into()));
+
+        // Unchecked and failed reads contribute no verdict or newer timestamp.
+        let fact = fact_with_grounds(vec![
+            latest,
+            older,
+            ground_with(None),
+            ground_with(Some(Outcome::Errored)),
+            ground_with(Some(Outcome::Inconclusive)),
+        ]);
+        assert_eq!(
+            aggregate_groundedness(&fact),
+            Groundedness::Refuted { at, by }
+        );
     }
 
     #[test]
