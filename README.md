@@ -16,7 +16,7 @@ Keep the store small enough that its contents are worth checking.
 
 ## Installation
 
-The Cargo package and Rust library are named `jishuken`; the command is `ken`.
+The Cargo package and Rust library are named `jishuken`.
 
 Build and install from a checkout:
 
@@ -26,10 +26,11 @@ cd jishuken
 cargo install --path jishuken
 ```
 
-Building requires Rust 1.90 or later;
-the repository pins its toolchain in `rust-toolchain.toml`.
+Building requires Rust 1.90 or later.
+The repository pins its toolchain in `rust-toolchain.toml`.
 Ordinary file sources need no other runtime.
-Scripts require Deno; reading a pinned repository revision requires Git or jj.
+Scripts require Deno.
+Reading a pinned repository revision requires Git or jj.
 
 ## Usage
 
@@ -41,7 +42,7 @@ ken add release.owner ryu --half-life P3D
 ken recall release.owner
 ```
 
-The key is `entity.relation`; the value here is `ryu`.
+The key is `entity.relation` — the value here is `ryu`.
 Keys are case-sensitive and use [Unicode NFC normalization](https://www.unicode.org/reports/tr31/#Normalization_and_Case),
 so composed and decomposed spellings of `é` identify the same fact.
 
@@ -84,7 +85,8 @@ Read those fields together:
 | `grounds` | The sources, predicates, and recorded outcomes behind that status. |
 
 `verified` means the checked grounds confirm the value.
-`refuted` means they reject it; do not rely on that answer.
+`refuted` means they reject it.
+Do not rely on that answer.
 `conflicted` means some grounds confirm it and others refute it.
 Inspect the outcomes and confidence before using the answer.
 Verification does not replace a scalar value with a new answer.
@@ -94,8 +96,8 @@ This replaces the value and its ground bindings and resets it to `ungrounded`.
 An optional `--ground` hint records a suggested source.
 It remains separate from active grounds and is never scheduled.
 Use `ken ground` with an explicit predicate before verification can begin.
-Hints from earlier stores are identified through the op log;
-their existence checks no longer count as evidence, and affected facts need rechecking.
+Hints from earlier stores are identified through the op log.
+Their existence checks no longer count as evidence, and affected facts need rechecking.
 
 For structured values, pass `--json values.json` instead of a scalar.
 A JSON array becomes one set-valued fact, checked as a unit,
@@ -115,8 +117,8 @@ ken doubt release.owner --reason "The runbook is out of date"
 ```
 
 `doubt` changes confidence and records the reason.
-`undo` reverses one logged operation;
-a command such as `ground` can produce more than one operation.
+`undo` reverses one logged operation.
+A command such as `ground` can produce more than one operation.
 Run `ken --help` or `ken <command> --help` for the full CLI.
 
 ## MCP
@@ -151,8 +153,8 @@ store facts and consult them.
 
 MCP callers cannot invoke `ground`, `verify`, `doubt`, or `grant`.
 Run the scheduler separately to check what agents ingest.
-This separation depends on the agent's other permissions;
-see [Security](#security).
+This separation depends on the agent's other permissions.
+See [Security](#security).
 
 ## Sources and predicates
 
@@ -182,8 +184,8 @@ A heading survives edits elsewhere in a document
 more reliably than line numbers.
 Each resolved span gets a content hash recorded with the check.
 Repository sources read the working file unless you pass `--rev` to `ground`.
-A commit ID pins the check to that historical revision;
-it won't detect later changes to the file.
+A commit ID pins the check to that historical revision.
+It won't detect later changes to the file.
 
 Tree-sitter locators (`#ts:`) parse but do not resolve.
 Direct URL sources such as `https://example.com/page#section`
@@ -226,8 +228,8 @@ the fact becomes conflicted.
 
 Command arguments are split on whitespace and executed directly.
 Shell quoting within the command, pipes, and redirection are not supported.
-The allowlist checks the program name only;
-commands run with the host user's permissions.
+The allowlist checks the program name only.
+Commands run with the host user's permissions.
 
 ### Generators and handlers
 
@@ -264,8 +266,8 @@ export default {
 Then `--source 'kb:Release#owner'` uses that handler
 with the same locator and predicate syntax as a file.
 The handler receives environment variables from its `env` allowlist.
-Generator and handler hashes include their source and declared capabilities;
-a changed hash makes the check fail until its binding is updated.
+Generator and handler hashes include their source and declared capabilities.
+A changed hash makes the check fail until its binding is updated.
 
 ## Design
 
@@ -277,10 +279,10 @@ After one half-life, confidence of `0.9` becomes `0.7`.
 Durations accept ISO 8601 (`PT15M`, `P2W`, `P1Y`)
 and shorthand without whitespace (`15m`, `2w`, `1h30m`).
 Lowercase, a leading `+`, and decimal fractions such as `PT1.5H` are accepted.
-`P1M` means one calendar month; `PT1M` and `1m` mean one minute.
+`P1M` means one calendar month — `PT1M` and `1m` mean one minute.
 Months and years count from the last verification date in UTC,
-constrained to the destination month's last day;
-days are always 24 hours.
+constrained to the destination month's last day.
+Days are always 24 hours.
 Durations must be positive, with at most nanosecond precision.
 `never` disables decay, including for ungrounded facts,
 without making them verified.
@@ -290,20 +292,20 @@ A confirmation or refutation updates confidence with a scalar Kalman filter.
 As time passes, the estimate's variance grows,
 so new evidence has more influence on an older belief.
 Commands and network-enabled scripts
-have higher measurement noise than local reads;
-their results move confidence less.
+have higher measurement noise than local reads.
+Their results move confidence less.
 
 Checks return `Confirmed`, `Refuted`, `Errored`, or `Inconclusive`.
 Only confirmation and refutation update confidence.
-A timeout or execution error leaves the previous evidence in place;
-confidence continues to age according to the fact’s half-life.
+A timeout or execution error leaves the previous evidence in place.
+Confidence continues to age according to the fact’s half-life.
 An unavailable source never counts as a fresh confirmation.
 
 The engine logs prior confidence and check outcomes
 to calibrate future LLM priors.
 It fits a Platt recalibration map once enough samples exist.
 `ken calibration` reports calibration error and reliability bins.
-These numbers assess the recorded checks;
+These numbers assess the recorded checks —
 they cannot establish that a source or predicate is trustworthy.
 
 ### Scheduling
@@ -315,13 +317,13 @@ priority = (1 - current confidence) * consequence / check cost
 ```
 
 Consequence uses Katz centrality over facts and their entities.
-Ungrounded and refuted facts contribute no weight;
-verified facts contribute fully, and conflicted facts contribute half.
+Ungrounded and refuted facts contribute no weight.
+Verified facts contribute fully, and conflicted facts contribute half.
 Generator and handler costs use measured median runtimes when available.
 
 A separate audit budget samples facts with distinct verifier identities.
-Identity is a generator or handler hash;
-file and command grounds share one identity.
+Identity is a generator or handler hash.
+File and command grounds share one identity.
 Two file sources alone therefore do not qualify for these audits.
 Different hashes also do not prove that two sources are independent.
 
@@ -367,7 +369,7 @@ except for calendar months and years, which need a reference date.
 `per_tick` limits selected facts, and `audit_per_tick` limits additional audits.
 Each selected fact can run several ground checks,
 so these are not caps on process count or total running time.
-`concurrency` limits simultaneous ground reads;
+`concurrency` limits simultaneous ground reads —
 the resulting writes are applied serially.
 
 ### Storage
@@ -391,7 +393,8 @@ and does not change your project's history.
 Fact files hold the current state.
 Every `WriteOp` produces one tagged record in `ops.jsonl`,
 including the before and after bytes of affected files.
-Writes use a store lock; operate the store with a single writer.
+Writes use a store lock.
+Operate the store with a single writer.
 Changes are staged, then committed with a rollback journal and atomic file replacement.
 An interrupted operation is rolled back when the store next opens.
 Fact filenames escape punctuation, Unicode, and uppercase letters
@@ -426,8 +429,8 @@ Restrict those permissions when relying on it.
 An MCP client can suggest a file source, but hints do not authorize reads.
 Review the source and predicate before binding them with `ken ground`.
 File reads use the host filesystem without a sandbox.
-Ingest can overwrite an existing key and its grounds;
-it has no separate challenge queue protecting the old value.
+Ingest can overwrite an existing key and its grounds.
+It has no separate challenge queue protecting the old value.
 
 Deno scripts run with declared network, read, and environment permissions,
 without write or subprocess permissions, and with a timeout.
@@ -444,7 +447,7 @@ A compromised endpoint, a stale runbook,
 or a predicate that only tests existence can all produce misleading confirmations.
 For consequential facts, bind sources with different failure modes
 and inspect disagreements.
-The span hash records which content was checked;
+The span hash records which content was checked —
 it does not authenticate that content or prove freshness.
 
 `ops.jsonl` is a local audit trail, not a tamper-proof record.
@@ -458,7 +461,8 @@ Budget settings and trust-weighted ranking do not supply those protections.
 
 ## Development
 
-The crate is in `jishuken/src/`; end-to-end tests are in `jishuken/tests/e2e.rs`.
+The crate is in `jishuken/src/`.
+End-to-end tests are in `jishuken/tests/e2e.rs`.
 Run the repository checks with:
 
 ```sh
