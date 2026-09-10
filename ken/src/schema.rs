@@ -10,19 +10,19 @@ pub type Symbol = String;
 /// identity: it is already canonical and unique, and it survives every
 /// re-verification because a verifier run changes the value, never the key. A
 /// key change is a different claim, i.e. a different fact, so no opaque id is
-/// needed (and hashing a unique key to "look like" a change id would be pure
+/// needed (and hashing a unique key to "look like" an id would be pure
 /// ceremony).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChangeId(pub String);
+pub struct FactId(pub String);
 
-impl ChangeId {
+impl FactId {
     /// The fact's identity: its `entity.relation` key, verbatim and greppable.
     pub fn for_claim(claim: &Claim) -> Self {
-        ChangeId(claim.key())
+        FactId(claim.key())
     }
 }
 
-impl std::fmt::Display for ChangeId {
+impl std::fmt::Display for FactId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -504,7 +504,7 @@ impl GroundBinding {
 /// Believed. Needs verification. The addressable, scheduled, verified unit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fact {
-    pub id: ChangeId,
+    pub id: FactId,
     pub claim: Claim,
     pub value: FactValue,
     pub epistemics: Epistemics,
@@ -583,11 +583,11 @@ mod tests {
     }
 
     #[test]
-    fn change_id_is_the_key_verbatim() {
+    fn fact_id_is_the_key_verbatim() {
         let c = Claim::parse_key("staging.url").unwrap();
-        assert_eq!(ChangeId::for_claim(&c), ChangeId::for_claim(&c));
+        assert_eq!(FactId::for_claim(&c), FactId::for_claim(&c));
         // Identity is the key itself: no hash, no opaque id.
-        assert_eq!(ChangeId::for_claim(&c).0, "staging.url");
+        assert_eq!(FactId::for_claim(&c).0, "staging.url");
     }
 
     #[test]

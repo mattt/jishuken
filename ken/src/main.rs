@@ -21,7 +21,7 @@ use ken::schema::{
     Claim, CommandSource, Element, Epistemics, Fact, FactValue, GroundBinding, GroundSource,
     Groundedness, Locator, SourceRef, SourceRoot, TriageSource, Volatility,
 };
-use ken::store::{JjStore, VersionedStore};
+use ken::store::KenStore;
 use ken::verify::authority;
 use ken::write::WriteOp;
 
@@ -66,7 +66,7 @@ enum Command {
     /// Facts currently holding two answers.
     Conflicts,
 
-    /// The operation log (this is `jj op log` underneath).
+    /// The operation log (the tagged `ops.jsonl` records).
     Log,
 
     /// Roll the store back one operation.
@@ -205,7 +205,7 @@ fn run() -> anyhow::Result<()> {
             Some(p) => p.clone(),
             None => std::env::current_dir()?.join(".ken"),
         };
-        let store = JjStore::init(&target)?;
+        let store = KenStore::init(&target)?;
         println!("initialized ken store at {}", store.root().display());
         return Ok(());
     }
@@ -267,7 +267,7 @@ fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_calibration(store: &JjStore, bins: usize, json: bool) -> anyhow::Result<()> {
+fn cmd_calibration(store: &KenStore, bins: usize, json: bool) -> anyhow::Result<()> {
     let samples = store.calibration_samples()?;
     let brier = brier_score(&samples);
     let reliability = reliability_bins(&samples, bins);
@@ -304,13 +304,13 @@ fn cmd_calibration(store: &JjStore, bins: usize, json: bool) -> anyhow::Result<(
     Ok(())
 }
 
-fn open_store(cli: &Cli) -> anyhow::Result<JjStore> {
+fn open_store(cli: &Cli) -> anyhow::Result<KenStore> {
     let cwd = std::env::current_dir()?;
-    Ok(JjStore::discover(cli.store.as_deref(), &cwd)?)
+    Ok(KenStore::discover(cli.store.as_deref(), &cwd)?)
 }
 
 fn cmd_add(
-    store: &JjStore,
+    store: &KenStore,
     AddArgs {
         key,
         value,
@@ -380,7 +380,7 @@ fn cmd_add(
 
 /// Turn a parsed source reference into a ground source (handler-backed scheme
 /// or plain file), capturing any handler's content hash now.
-fn source_to_ground(store: &JjStore, src: SourceRef) -> anyhow::Result<GroundSource> {
+fn source_to_ground(store: &KenStore, src: SourceRef) -> anyhow::Result<GroundSource> {
     Ok(ken::ground::ground_source_for(
         store.config(),
         store.root(),
@@ -389,7 +389,7 @@ fn source_to_ground(store: &JjStore, src: SourceRef) -> anyhow::Result<GroundSou
 }
 
 fn cmd_ground(
-    store: &JjStore,
+    store: &KenStore,
     GroundArgs {
         key,
         source,
@@ -437,7 +437,7 @@ fn cmd_ground(
     Ok(())
 }
 
-fn cmd_recall(store: &JjStore, key: &str, json: bool) -> anyhow::Result<()> {
+fn cmd_recall(store: &KenStore, key: &str, json: bool) -> anyhow::Result<()> {
     let fact = store.read_fact_by_key(key)?;
     let now = Utc::now();
     let conf = decayed_confidence(&fact, now, store.config());
@@ -490,7 +490,7 @@ fn cmd_recall(store: &JjStore, key: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
+fn cmd_why(store: &KenStore, key: &str) -> anyhow::Result<()> {
     let fact = store.read_fact_by_key(key)?;
     println!("{key} = {}", fact.value.render());
     println!(
@@ -500,8 +500,8 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
         ken::write::landed_confidence(&TriageSource::Ingest).min(fact.epistemics.confidence),
     );
 
-    // Ground-check operations for this fact, oldest first (tagged change log).
-    let mut ops = store.change_log()?;
+    // Ground-check operations for this fact, oldest first (tagged op log).
+    let mut ops = store.op_log(None)?;
     ops.reverse();
     for op in &ops {
         if op.description.contains("[GroundCheck") && op.description.contains(key) {
@@ -552,7 +552,7 @@ fn cmd_why(store: &JjStore, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_stale(store: &JjStore, limit: usize) -> anyhow::Result<()> {
+fn cmd_stale(store: &KenStore, limit: usize) -> anyhow::Result<()> {
     let facts = store.all_facts()?;
     let now = Utc::now();
     let costs = store.cost_table();
@@ -576,7 +576,7 @@ fn cmd_stale(store: &JjStore, limit: usize) -> anyhow::Result<()> {
 }
 
 fn cmd_search(
-    store: &JjStore,
+    store: &KenStore,
     SearchArgs {
         query,
         entity,
@@ -655,7 +655,7 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_conflicts(store: &JjStore) -> anyhow::Result<()> {
+fn cmd_conflicts(store: &KenStore) -> anyhow::Result<()> {
     let ids = store.list_conflicts()?;
     if ids.is_empty() {
         println!("no conflicts");
@@ -669,7 +669,7 @@ fn cmd_conflicts(store: &JjStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_log(store: &JjStore) -> anyhow::Result<()> {
+fn cmd_log(store: &KenStore) -> anyhow::Result<()> {
     for op in store.op_log(None)? {
         println!("{}  {}  {}", short_op(&op.id), op.time, op.description);
     }
@@ -677,7 +677,7 @@ fn cmd_log(store: &JjStore) -> anyhow::Result<()> {
 }
 
 fn cmd_doubt(
-    store: &JjStore,
+    store: &KenStore,
     key: &str,
     reason: String,
     confidence: Option<f64>,
@@ -695,7 +695,7 @@ fn cmd_doubt(
     Ok(())
 }
 
-fn cmd_tick(store: &JjStore) -> anyhow::Result<()> {
+fn cmd_tick(store: &KenStore) -> anyhow::Result<()> {
     let results = engine::tick(store)?;
     if results.is_empty() {
         println!("nothing due");
@@ -708,7 +708,7 @@ fn cmd_tick(store: &JjStore) -> anyhow::Result<()> {
 }
 
 fn cmd_serve(
-    store: &JjStore,
+    store: &KenStore,
     interval: Option<String>,
     once: bool,
     install: bool,
@@ -951,12 +951,12 @@ fn volatility_label(v: Volatility) -> &'static str {
     }
 }
 
-fn due_at(fact: &Fact, store: &JjStore) -> Option<DateTime<Utc>> {
+fn due_at(fact: &Fact, store: &KenStore) -> Option<DateTime<Utc>> {
     let hl = half_life_secs(fact.schedule.volatility, store.config())?;
     Some(fact.schedule.last_verified + chrono::Duration::seconds(hl as i64))
 }
 
-fn is_due(fact: &Fact, store: &JjStore, now: DateTime<Utc>) -> bool {
+fn is_due(fact: &Fact, store: &KenStore, now: DateTime<Utc>) -> bool {
     due_at(fact, store).is_some_and(|d| d <= now)
 }
 

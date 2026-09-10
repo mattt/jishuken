@@ -20,7 +20,7 @@ use ken::scheduler;
 use ken::schema::{
     Claim, Fact, FactValue, GroundBinding, Groundedness, Outcome, TriageSource, Volatility,
 };
-use ken::store::{JjStore, VersionedStore};
+use ken::store::KenStore;
 use ken::write::WriteOp;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
@@ -320,18 +320,18 @@ impl KenServer {
 }
 
 impl KenServer {
-    fn open(&self) -> Result<JjStore, String> {
-        JjStore::open(&self.store_path).map_err(|e| format!("store: {e}"))
+    fn open(&self) -> Result<KenStore, String> {
+        KenStore::open(&self.store_path).map_err(|e| format!("store: {e}"))
     }
 
-    fn open_data(&self) -> Result<JjStore, ErrorData> {
+    fn open_data(&self) -> Result<KenStore, ErrorData> {
         self.open().map_err(|e| ErrorData::internal_error(e, None))
     }
 }
 
 // --- shared read helpers, used by both tools and resources ---
 
-fn recall_output(store: &JjStore, key: &str) -> Result<RecallOutput, String> {
+fn recall_output(store: &KenStore, key: &str) -> Result<RecallOutput, String> {
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let conf = decayed_confidence(&fact, now, store.config());
@@ -349,7 +349,7 @@ fn recall_output(store: &JjStore, key: &str) -> Result<RecallOutput, String> {
     })
 }
 
-fn conflicts_value(store: &JjStore) -> Result<Value, String> {
+fn conflicts_value(store: &KenStore) -> Result<Value, String> {
     let ids = store.list_conflicts().map_err(|e| e.to_string())?;
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let mut conflicts = Vec::new();
@@ -386,7 +386,7 @@ fn conflicts_value(store: &JjStore) -> Result<Value, String> {
 /// Facts ranked by value of information (DESIGN §7): the ones most likely to be
 /// both wrong and consequential. A read-only window onto what the scheduler
 /// would check next, so an agent can distrust the memories that are due.
-fn stale_value(store: &JjStore) -> Result<Value, String> {
+fn stale_value(store: &KenStore) -> Result<Value, String> {
     let facts = store.all_facts().map_err(|e| e.to_string())?;
     let now = chrono::Utc::now();
     let costs = store.cost_table();
@@ -408,9 +408,9 @@ fn stale_value(store: &JjStore) -> Result<Value, String> {
 
 /// Provenance back to the ground sources (the `ken why` answer, as JSON): where
 /// the fact came from, the ground checks against it, and whether they disagree.
-fn why_value(store: &JjStore, key: &str) -> Result<Value, String> {
+fn why_value(store: &KenStore, key: &str) -> Result<Value, String> {
     let fact = store.read_fact_by_key(key).map_err(|e| e.to_string())?;
-    let mut ops = store.change_log().map_err(|e| e.to_string())?;
+    let mut ops = store.op_log(None).map_err(|e| e.to_string())?;
     ops.reverse();
     let checks: Vec<Value> = ops
         .iter()
@@ -524,7 +524,7 @@ fn key_overlap(candidate_key: &str, query: &str) -> usize {
 }
 
 /// The existing keys most similar to `query`, by token overlap, best first.
-fn nearest_keys(store: &JjStore, query: &str, limit: usize) -> Vec<String> {
+fn nearest_keys(store: &KenStore, query: &str, limit: usize) -> Vec<String> {
     let Ok(facts) = store.all_facts() else {
         return Vec::new();
     };
@@ -540,7 +540,7 @@ fn nearest_keys(store: &JjStore, query: &str, limit: usize) -> Vec<String> {
 
 /// Turn a bare recall failure into an actionable message: name the likely
 /// mistake and point at `ken_search`, with the closest existing keys.
-fn recall_hint(store: &JjStore, key: &str, err: &str) -> String {
+fn recall_hint(store: &KenStore, key: &str, err: &str) -> String {
     use std::fmt::Write as _;
     let mut msg = format!("{err}. ");
     if !key.contains('.') {
@@ -630,7 +630,7 @@ fn prompt_messages(
 
 // --- completion: suggest the keys actually in the store ---
 
-fn completion_values(store: &JjStore, arg_name: &str, partial: &str) -> Vec<String> {
+fn completion_values(store: &KenStore, arg_name: &str, partial: &str) -> Vec<String> {
     let Ok(facts) = store.all_facts() else {
         return Vec::new();
     };
@@ -812,7 +812,7 @@ pub fn serve(store_path: PathBuf) -> anyhow::Result<()> {
 mod tests {
     use super::{hit_score, key_overlap, query_tokens};
     use super::{IngestParams, KenServer, RecallParams, SearchParams};
-    use ken::store::{jj_available, JjStore};
+    use ken::store::KenStore;
     use rmcp::handler::server::wrapper::Parameters;
 
     fn ingest_params(key: &str, value: &str) -> IngestParams {
@@ -825,20 +825,16 @@ mod tests {
         }
     }
 
-    /// Drive the served tool surface end to end against a real jj store:
+    /// Drive the served tool surface end to end against a real store:
     /// ingest -> tokenized search -> recall (hit and actionable miss) ->
     /// conflicts with the `distrusted` section. Control-plane fixture state is
     /// created through `ken::engine` (the same path the CLI uses); the served
     /// surface itself stays data-plane only.
     #[test]
     fn tool_surface_roundtrip_against_real_store() {
-        if !jj_available() {
-            eprintln!("skipping: jj not on PATH");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".ken");
-        let store = JjStore::init(&root).unwrap();
+        let store = KenStore::init(&root).unwrap();
         let server = KenServer {
             store_path: root.clone(),
         };
@@ -936,7 +932,7 @@ mod tests {
         );
     }
 
-    fn ground(store: &JjStore, key: &str, source: &str) {
+    fn ground(store: &KenStore, key: &str, source: &str) {
         let (src, locator) = ken::ground::locator::parse_source(source, None).unwrap();
         let binding = ken::schema::GroundBinding {
             source: ken::schema::GroundSource::File(src),

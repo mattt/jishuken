@@ -1,14 +1,18 @@
-//! The storage seam (DESIGN §4). CLI-first: the [`VersionedStore`] trait sits at
-//! the boundary and [`JjStore`] implements it over the `jj` CLI. A fact is a
-//! file at `facts/<entity>/<relation>.json`, so content-addressing is free and a
-//! concurrent disagreeing write becomes a real jj conflict instead of a lost
-//! update. Every [`WriteOp`] becomes one tagged jj operation.
+//! The storage seam (DESIGN §4). A fact is a file at
+//! `facts/<entity>/<relation>.json`, so the store greps and diffs like code.
+//! Every [`WriteOp`] lands as one tagged record in an append-only op log
+//! (`ops.jsonl`) that `ken` owns: the log is the audit, the fact files are the
+//! working state, and `undo` replays a record's saved bytes in reverse. Writes
+//! serialize behind a store lock; single-writer is the supported posture.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::calibration::CalibrationSample;
 use crate::centrality::FactGraph;
@@ -17,31 +21,18 @@ use crate::decay::{decayed_variance, kalman_update};
 use crate::error::{Error, Result};
 use crate::ground::generator::GeneratorRegistry;
 use crate::schema::{
-    path_for, ChangeId, Claim, Epistemics, Fact, FactValue, GeneratorHash, GroundBinding,
+    path_for, Claim, Epistemics, Fact, FactId, FactValue, GeneratorHash, GroundBinding,
     Groundedness, Provenance, ScheduleMeta, Timestamp,
 };
 use crate::sketch::TDigest;
 use crate::write::{landed_confidence_with, Outcome, WriteOp};
 
-/// Which revision to read at. `@` is the working copy.
-#[derive(Debug, Clone)]
-pub enum Rev {
-    Working,
-    At(String),
-}
-
-impl Rev {
-    fn as_arg(&self) -> String {
-        match self {
-            Rev::Working => "@".to_string(),
-            Rev::At(s) => s.clone(),
-        }
-    }
-}
-
+/// An op-log record id (blake3 prefix over the previous id, tag, detail, time).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpId(pub String);
 
+/// One entry in the op log, as read back for `ken log` / `ken why`. The
+/// `description` is `[Tag] detail`, so the audit stays greppable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
     pub id: String,
@@ -49,72 +40,59 @@ pub struct Operation {
     pub description: String,
 }
 
-/// Handle to an anonymous hypothesis change (DESIGN §4).
-#[derive(Debug, Clone)]
-pub struct Workspace {
-    pub change: String,
-}
-
-/// The store, reached through one trait (README "Library"). Every method
-/// returns an error if the underlying store cannot be read or written, or (for
-/// historical revisions) the `jj` invocation fails.
-pub trait VersionedStore {
-    /// Read a fact by id at a given revision.
-    ///
-    /// # Errors
-    /// See the trait-level note.
-    fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact>;
-    /// Apply one [`WriteOp`], landing it as one tagged jj operation.
-    ///
-    /// # Errors
-    /// See the trait-level note.
-    fn apply(&self, op: WriteOp) -> Result<ChangeId>;
-    /// The facts currently in a `Conflicted` state.
-    ///
-    /// # Errors
-    /// See the trait-level note.
-    fn list_conflicts(&self) -> Result<Vec<ChangeId>>;
-    /// The operation log, newest first, optionally truncated at `since`.
-    ///
-    /// # Errors
-    /// See the trait-level note.
-    fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>>;
-    /// Start an anonymous hypothesis change off `base`.
-    ///
-    /// # Errors
-    /// See the trait-level note.
-    fn branch_hypothesis(&self, base: Rev) -> Result<Workspace>;
-}
-
 /// Initial posterior variance for a freshly ingested, unverified fact: high, so
 /// the first verifier run moves it a lot.
 const INGEST_VARIANCE: f64 = 0.25;
 
-/// ASCII separators used to parse the jj op-log template unambiguously.
-const US: char = '\u{1f}';
-const RS: char = '\u{1e}';
+/// A lock older than this is treated as abandoned by a crashed writer and
+/// stolen. The lock is held only for the duration of a single write, so a fresh
+/// lock always means a live writer.
+const STALE_LOCK: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
-pub struct JjStore {
-    root: PathBuf,
-    config: Config,
+/// One file touched by an op: its path (relative to the store root) and the
+/// bytes before and after. `before: None` means the op created the file;
+/// `undo` restores `before`, deleting the file when it is `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Change {
+    path: String,
+    before: Option<String>,
+    after: Option<String>,
 }
 
-impl JjStore {
+/// One op-log record. Serialized as a single line in `ops.jsonl`, oldest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OpRecord {
+    id: String,
+    time: String,
+    tag: String,
+    detail: String,
+    #[serde(default)]
+    changes: Vec<Change>,
+}
+
+#[derive(Debug)]
+pub struct KenStore {
+    root: PathBuf,
+    config: Config,
+    /// Changes accumulated by the in-flight op, drained when it is committed.
+    pending: Mutex<Vec<Change>>,
+}
+
+impl KenStore {
     /// Discover the store by walking up from `start` for a `.ken/` directory,
-    /// the way jj finds `.jj/`. Honors an explicit override first.
+    /// the way `git` finds `.git/`. Honors an explicit override first.
     ///
     /// # Errors
     /// Returns [`Error::StoreNotFound`] if no `.ken/` store is found.
-    pub fn discover(explicit: Option<&Path>, start: &Path) -> Result<JjStore> {
+    pub fn discover(explicit: Option<&Path>, start: &Path) -> Result<KenStore> {
         if let Some(p) = explicit {
-            return JjStore::open(p);
+            return KenStore::open(p);
         }
         let mut dir = Some(start);
         while let Some(d) = dir {
             let candidate = d.join(".ken");
-            if candidate.join(".jj").is_dir() {
-                return JjStore::open(&candidate);
+            if candidate.join("ken.toml").is_file() {
+                return KenStore::open(&candidate);
             }
             dir = d.parent();
         }
@@ -124,18 +102,17 @@ impl JjStore {
     /// Open an existing `.ken/` store at `root`.
     ///
     /// # Errors
-    /// Returns [`Error::StoreNotFound`] if `root` is not a jj-backed store, or
-    /// [`Error::Jj`] if the installed `jj` is missing or older than
-    /// [`JJ_MIN_VERSION`].
-    pub fn open(root: &Path) -> Result<JjStore> {
-        ensure_jj_supported()?;
-        if !root.join(".jj").is_dir() {
+    /// Returns [`Error::StoreNotFound`] if `root` is not a `ken` store (no
+    /// `ken.toml`).
+    pub fn open(root: &Path) -> Result<KenStore> {
+        if !root.join("ken.toml").is_file() {
             return Err(Error::StoreNotFound);
         }
         let config = Config::load_or_default(&root.join("ken.toml"));
-        Ok(JjStore {
+        Ok(KenStore {
             root: root.to_path_buf(),
             config,
+            pending: Mutex::new(Vec::new()),
         })
     }
 
@@ -151,33 +128,27 @@ impl JjStore {
         GeneratorRegistry::new(&self.root)
     }
 
-    /// Create a `.ken/` store: a jj repo with `ken.toml`, `facts/`, `verifiers/`.
+    /// Create a `.ken/` store: `ken.toml`, `facts/`, `verifiers/`, and an op log
+    /// seeded with one `[Init]` record.
     ///
     /// # Errors
-    /// Returns an error if the directories cannot be created, a `jj` invocation
-    /// fails, or the installed `jj` is missing or older than [`JJ_MIN_VERSION`].
-    pub fn init(root: &Path) -> Result<JjStore> {
-        ensure_jj_supported()?;
+    /// Returns an error if the directories or files cannot be created.
+    pub fn init(root: &Path) -> Result<KenStore> {
         std::fs::create_dir_all(root)?;
-        // `git init` must not pass `-R` (no repo exists yet to resolve).
-        run_jj_raw(root, &["git", "init", "."])?;
-        // Pin an identity so commits never block on missing user config.
-        run_jj_in(root, &["config", "set", "--repo", "user.name", "ken"])?;
-        run_jj_in(
-            root,
-            &["config", "set", "--repo", "user.email", "ken@localhost"],
-        )?;
         std::fs::create_dir_all(root.join("facts"))?;
         std::fs::create_dir_all(root.join("verifiers"))?;
         let cfg = Config::default();
         std::fs::write(root.join("ken.toml"), cfg.to_toml())?;
-        run_jj_in(root, &["describe", "-m", "[Init] ken store"])?;
-        run_jj_in(root, &["new"])?;
-        JjStore::open(root)
+        let store = KenStore::open(root)?;
+        {
+            let _lock = store.lock()?;
+            store.append_op("Init", "ken store")?;
+        }
+        Ok(store)
     }
 
-    fn jj(&self, args: &[&str]) -> Result<String> {
-        run_jj_in(&self.root, args)
+    fn ops_path(&self) -> PathBuf {
+        self.root.join("ops.jsonl")
     }
 
     fn fact_path(&self, claim: &Claim) -> PathBuf {
@@ -194,6 +165,11 @@ impl JjStore {
         let path = self.fact_path(&claim);
         let bytes = std::fs::read(&path).map_err(|_| Error::FactNotFound(key.to_string()))?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Read a fact by id from the working copy.
+    fn read_fact(&self, id: &FactId) -> Result<Fact> {
+        self.read_fact_by_key(&id.0)
     }
 
     /// All facts currently in the store (scans `facts/`).
@@ -226,17 +202,28 @@ impl JjStore {
         Ok(out)
     }
 
+    /// Write a fact file, recording the before/after bytes on the in-flight op
+    /// so it can be undone.
     fn write_fact(&self, fact: &Fact) -> Result<()> {
         let path = self.fact_path(&fact.claim);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, serde_json::to_vec_pretty(fact)?)?;
+        let before = std::fs::read_to_string(&path).ok();
+        let after = String::from_utf8(serde_json::to_vec_pretty(fact)?)
+            .expect("serde_json emits valid utf-8");
+        std::fs::write(&path, &after)?;
+        self.pending.lock().expect("pending lock").push(Change {
+            path: path_for(&fact.claim),
+            before,
+            after: Some(after),
+        });
         Ok(())
     }
 
-    /// Persist a fact file without committing. Control-plane callers use this
-    /// alongside [`JjStore::control_commit`] to land one tagged op.
+    /// Persist a fact file, recording it on the in-flight op. Control-plane
+    /// callers use this alongside [`KenStore::control_commit`] to land one
+    /// tagged op.
     ///
     /// # Errors
     /// Returns an error if the fact file cannot be written.
@@ -244,28 +231,65 @@ impl JjStore {
         self.write_fact(fact)
     }
 
-    /// Commit the working copy as one tagged jj operation (DESIGN §3, §4).
-    fn commit(&self, tag: &str, detail: &str) -> Result<()> {
-        let msg = format!("[{tag}] {detail}");
-        self.jj(&["commit", "-m", &msg])?;
+    /// Append one op-log record, draining the changes the in-flight op recorded.
+    fn append_op(&self, tag: &str, detail: &str) -> Result<()> {
+        let changes = std::mem::take(&mut *self.pending.lock().expect("pending lock"));
+        let time = Utc::now().to_rfc3339();
+        let prev = self.last_op_id()?;
+        let seed = format!("{prev}\u{1f}{tag}\u{1f}{detail}\u{1f}{time}");
+        let id = blake3::hash(seed.as_bytes()).to_hex()[..12].to_string();
+        let rec = OpRecord {
+            id,
+            time,
+            tag: tag.to_string(),
+            detail: detail.to_string(),
+            changes,
+        };
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.ops_path())?;
+        writeln!(f, "{}", serde_json::to_string(&rec)?)?;
+        f.sync_all()?;
         Ok(())
+    }
+
+    /// Commit the in-flight op under a tag (private; every write path ends here).
+    fn commit(&self, tag: &str, detail: &str) -> Result<()> {
+        self.append_op(tag, detail)
     }
 
     /// Control-plane tagged commit (e.g. `Grant`), one loud logged operation.
     ///
     /// # Errors
-    /// Returns an error if the `jj commit` invocation fails.
+    /// Returns an error if the op log cannot be appended.
     pub fn control_commit(&self, tag: &str, detail: &str) -> Result<()> {
-        self.commit(tag, detail)
+        self.append_op(tag, detail)
     }
 
-    fn current_change_id(&self) -> Result<String> {
-        let out = self.jj(&["log", "-r", "@", "--no-graph", "-T", "change_id.short()"])?;
-        Ok(out.trim().to_string())
+    /// Read the op log, oldest first. A missing log reads as empty.
+    fn read_ops(&self) -> Result<Vec<OpRecord>> {
+        let text = match std::fs::read_to_string(self.ops_path()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect())
+    }
+
+    /// The id of the newest op-log record, or an empty string if the log is empty.
+    fn last_op_id(&self) -> Result<String> {
+        Ok(self
+            .read_ops()?
+            .last()
+            .map_or_else(String::new, |r| r.id.clone()))
     }
 
     fn append_calibration(&self, sample: &CalibrationSample) -> Result<()> {
-        use std::io::Write;
         let path = self.root.join("calibration.jsonl");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -326,28 +350,74 @@ impl JjStore {
             .collect()
     }
 
-    /// Roll the store back one operation (`ken undo`).
+    /// Roll the store back one operation (`ken undo`): restore the saved bytes
+    /// of the last non-`Undo` op, then log an `[Undo]` record.
     ///
     /// # Errors
-    /// Returns an error if the `jj undo` invocation fails.
+    /// Returns an error if the log cannot be read or a file cannot be restored.
     pub fn undo(&self) -> Result<()> {
-        self.jj(&["undo"]).map(|_| ())
+        let _lock = self.lock()?;
+        let recs = self.read_ops()?;
+        let Some(rec) = recs.iter().rev().find(|r| r.tag != "Undo") else {
+            return Err(Error::Store("nothing to undo".into()));
+        };
+        // Replay in reverse so the earliest `before` for a path wins, leaving
+        // each file as it was before the op ran.
+        for ch in rec.changes.iter().rev() {
+            let path = self.root.join(&ch.path);
+            match &ch.before {
+                Some(bytes) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, bytes)?;
+                }
+                None => {
+                    if path.exists() {
+                        std::fs::remove_file(&path)?;
+                    }
+                }
+            }
+        }
+        let detail = format!("{} {}", rec.tag, rec.detail);
+        self.append_op("Undo", detail.trim())?;
+        Ok(())
     }
 
-    /// The tagged change descriptions (`[Ingest] …`, `[GroundCheck:confirmed] …`),
-    /// newest first. This is where each [`WriteOp`]'s variant is recorded, so the
-    /// audit "groundedness only ever moved via `GroundCheck`" is greppable here.
+    /// The operation log, newest first, optionally truncated at `since`
+    /// (keeping only records strictly newer than the `since` id).
     ///
     /// # Errors
-    /// Returns an error if the `jj log` invocation fails.
-    pub fn change_log(&self) -> Result<Vec<Operation>> {
-        let template = format!(
-            "change_id.short() ++ \"{US}\" ++ committer.timestamp() ++ \"{US}\" ++ description ++ \"{RS}\""
-        );
-        let out = self.jj(&["log", "-r", "::@", "--no-graph", "-T", &template])?;
-        Ok(parse_log_records(&out)
+    /// Returns an error if the op log cannot be read.
+    pub fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>> {
+        let mut ops: Vec<Operation> = self
+            .read_ops()?
+            .iter()
+            .rev()
+            .map(|r| Operation {
+                id: r.id.clone(),
+                time: r.time.clone(),
+                description: format!("[{}] {}", r.tag, r.detail),
+            })
+            .collect();
+        if let Some(OpId(stop)) = since {
+            if let Some(pos) = ops.iter().position(|o| o.id == stop) {
+                ops.truncate(pos);
+            }
+        }
+        Ok(ops)
+    }
+
+    /// The facts currently in a `Conflicted` state.
+    ///
+    /// # Errors
+    /// Returns an error if the facts cannot be read.
+    pub fn list_conflicts(&self) -> Result<Vec<FactId>> {
+        Ok(self
+            .all_facts()?
             .into_iter()
-            .filter(|o| !o.description.is_empty())
+            .filter(|f| matches!(f.epistemics.groundedness, Groundedness::Conflicted { .. }))
+            .map(|f| f.id)
             .collect())
     }
 
@@ -389,81 +459,27 @@ impl JjStore {
         }
         Ok(changed)
     }
-}
 
-impl VersionedStore for JjStore {
-    fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact> {
-        match at {
-            Rev::Working => {
-                for f in self.all_facts()? {
-                    if &f.id == id {
-                        return Ok(f);
-                    }
-                }
-                Err(Error::FactNotFound(id.0.clone()))
-            }
-            Rev::At(_) => {
-                // At a historical rev, locate the fact's path then `jj file show`.
-                let fact = self.read_fact(id, Rev::Working)?;
-                let path = path_for(&fact.claim);
-                let text = self.jj(&["file", "show", "-r", &at.as_arg(), &path])?;
-                Ok(serde_json::from_str(&text)?)
-            }
-        }
-    }
-
-    fn apply(&self, op: WriteOp) -> Result<ChangeId> {
+    /// Apply one [`WriteOp`], landing it as one tagged op-log record.
+    ///
+    /// # Errors
+    /// Returns an error if the store cannot be read or written.
+    pub fn apply(&self, op: WriteOp) -> Result<FactId> {
         self.apply_op(op, true)
     }
 
-    fn list_conflicts(&self) -> Result<Vec<ChangeId>> {
-        Ok(self
-            .all_facts()?
-            .into_iter()
-            .filter(|f| matches!(f.epistemics.groundedness, Groundedness::Conflicted { .. }))
-            .map(|f| f.id)
-            .collect())
-    }
-
-    fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>> {
-        // jj templates don't accept `\u{..}` escapes, so embed the ASCII unit/
-        // record separators (US 0x1f, RS 0x1e) directly inside the strings.
-        let template = format!(
-            "self.id().short() ++ \"{US}\" ++ self.time().start() ++ \"{US}\" ++ self.description() ++ \"{RS}\""
-        );
-        let out = self.jj(&["op", "log", "--no-graph", "-T", &template])?;
-        let mut ops = Vec::new();
-        for op in parse_log_records(&out) {
-            if let Some(OpId(stop)) = &since {
-                if &op.id == stop {
-                    break;
-                }
-            }
-            ops.push(op);
-        }
-        Ok(ops)
-    }
-
-    fn branch_hypothesis(&self, base: Rev) -> Result<Workspace> {
-        self.jj(&["new", &base.as_arg()])?;
-        Ok(Workspace {
-            change: self.current_change_id()?,
-        })
-    }
-}
-
-impl JjStore {
     /// Apply a write op without recomputing centrality. The scheduler tick
     /// (Idea 1) uses this to coalesce N per-check recomputes into one after the
     /// loop; `recompute_centrality` is then called once and committed separately.
     ///
     /// # Errors
-    /// Returns an error if the underlying write or `jj` invocation fails.
-    pub fn apply_no_centrality(&self, op: WriteOp) -> Result<ChangeId> {
+    /// Returns an error if the underlying write fails.
+    pub fn apply_no_centrality(&self, op: WriteOp) -> Result<FactId> {
         self.apply_op(op, false)
     }
 
-    fn apply_op(&self, op: WriteOp, recompute_centrality: bool) -> Result<ChangeId> {
+    fn apply_op(&self, op: WriteOp, recompute_centrality: bool) -> Result<FactId> {
+        let _lock = self.lock()?;
         let tag = op.tag();
         match op {
             WriteOp::Ingest {
@@ -474,7 +490,7 @@ impl JjStore {
                 draft_ground,
             } => {
                 let now = Utc::now();
-                let id = ChangeId::for_claim(&claim);
+                let id = FactId::for_claim(&claim);
                 // DESIGN §8: grade the LLM triage that produced this prior. The
                 // Platt map fitted from logged (prior, outcome) pairs is applied
                 // to LLM-triaged confidence; identity until enough samples.
@@ -513,7 +529,7 @@ impl JjStore {
             WriteOp::Ground {
                 fact: id, binding, ..
             } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let mut fact = self.read_fact(&id)?;
                 let detail = format!(
                     "{} <- {}",
                     fact.claim.key(),
@@ -535,7 +551,7 @@ impl JjStore {
                 observed_cost,
                 ..
             } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let mut fact = self.read_fact(&id)?;
                 let now = Utc::now();
                 let net = fact.grounds.get(ground).is_some_and(GroundBinding::is_net);
 
@@ -588,7 +604,7 @@ impl JjStore {
                 new_priority,
                 ..
             } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let mut fact = self.read_fact(&id)?;
                 fact.schedule.priority = new_priority;
                 self.write_fact(&fact)?;
                 self.commit(&tag, &fact.claim.key())?;
@@ -601,13 +617,61 @@ impl JjStore {
                 reason,
                 ..
             } => {
-                let mut fact = self.read_fact(&id, Rev::Working)?;
+                let mut fact = self.read_fact(&id)?;
                 fact.epistemics = set;
                 self.write_fact(&fact)?;
                 self.commit(&tag, &format!("{} :: {}", fact.claim.key(), reason))?;
                 Ok(id)
             }
         }
+    }
+
+    /// Take the store's exclusive write lock. A crashed writer's lock (older
+    /// than [`STALE_LOCK`]) is stolen; a fresh one is refused.
+    fn lock(&self) -> Result<LockGuard> {
+        let path = self.root.join("lock");
+        for _ in 0..2 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(LockGuard { path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .map(|t| t.elapsed().map(|d| d > STALE_LOCK).unwrap_or(true))
+                        .unwrap_or(false);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    let pid = std::fs::read_to_string(&path).unwrap_or_default();
+                    return Err(Error::Store(format!(
+                        "store is locked by pid {}; remove {} if no ken is running",
+                        pid.trim(),
+                        path.display()
+                    )));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Error::Store("could not acquire store lock".into()))
+    }
+}
+
+/// Releases the store lock file on drop.
+#[derive(Debug)]
+struct LockGuard {
+    path: PathBuf,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -657,128 +721,85 @@ fn aggregate_groundedness(fact: &Fact) -> Groundedness {
     }
 }
 
-/// Parse the US/RS-delimited jj log template output into operations, one per
-/// non-empty record. Callers apply their own filtering (empty descriptions,
-/// `since` truncation).
-fn parse_log_records(out: &str) -> Vec<Operation> {
-    out.split(RS)
-        .map(|record| record.trim_matches(|c: char| c == '\n' || c == '\r'))
-        .filter(|record| !record.is_empty())
-        .map(|record| {
-            let mut parts = record.splitn(3, US);
-            Operation {
-                id: parts.next().unwrap_or("").trim().to_string(),
-                time: parts.next().unwrap_or("").trim().to_string(),
-                description: parts.next().unwrap_or("").trim().to_string(),
-            }
-        })
-        .collect()
-}
-
-fn run_jj_in(dir: &Path, args: &[&str]) -> Result<String> {
-    // Always operate on the given repo explicitly; never inherit ambient jj
-    // discovery (README "Where the store lives").
-    let mut full: Vec<&str> = vec!["-R", dir.to_str().unwrap_or(".")];
-    full.extend_from_slice(args);
-    run_jj_argv(dir, &full, args)
-}
-
-/// Run jj without the explicit `-R` (used only for `git init`, before the repo
-/// exists). Operates in `dir` so the new repo lands there.
-fn run_jj_raw(dir: &Path, args: &[&str]) -> Result<String> {
-    run_jj_argv(dir, args, args)
-}
-
-fn run_jj_argv(dir: &Path, argv: &[&str], label: &[&str]) -> Result<String> {
-    let output = Command::new("jj")
-        .args(argv)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| Error::Jj(format!("spawning jj: {e}")))?;
-    if !output.status.success() {
-        return Err(Error::Jj(format!(
-            "jj {}: {}",
-            label.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
 fn whoami() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "agent".to_string())
 }
 
-/// Is the `jj` CLI available on PATH? Used to gate integration tests.
-pub fn jj_available() -> bool {
-    Command::new("jj")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Minimum supported `jj` version (the version ken is developed and tested
-/// against). jj's CLI surface moves before 1.0, so the store refuses to run
-/// against an older jj rather than failing obscurely mid-operation.
-pub const JJ_MIN_VERSION: (u32, u32) = (0, 42);
-
-/// Parse `jj --version` output ("jj 0.42.0") into `(major, minor)`.
-fn parse_jj_version(output: &str) -> Option<(u32, u32)> {
-    let rest = output.trim().strip_prefix("jj ")?;
-    let mut parts = rest.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
-}
-
-/// Enforce the jj version pin once per process (the result cannot change while
-/// we run, so this is a perf-only cache).
-fn ensure_jj_supported() -> Result<()> {
-    use std::sync::OnceLock;
-    static CHECK: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    CHECK
-        .get_or_init(|| {
-            let (want_major, want_minor) = JJ_MIN_VERSION;
-            let output = Command::new("jj").arg("--version").output().map_err(|e| {
-                format!("jj not found on PATH ({e}); ken requires jj >= {want_major}.{want_minor}")
-            })?;
-            let text = String::from_utf8_lossy(&output.stdout);
-            let Some((major, minor)) = parse_jj_version(&text) else {
-                return Err(format!(
-                    "could not parse `jj --version` output {text:?}; ken requires jj >= {want_major}.{want_minor}"
-                ));
-            };
-            if (major, minor) < (want_major, want_minor) {
-                return Err(format!(
-                    "jj {major}.{minor} is older than the supported minimum {want_major}.{want_minor}; \
-                     upgrade jj (ken pins to a supported jj version until jj reaches 1.0)"
-                ));
-            }
-            Ok(())
-        })
-        .clone()
-        .map_err(Error::Jj)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_groundedness, parse_jj_version, parse_log_records};
+    use super::{aggregate_groundedness, KenStore, OpId};
     use crate::ground::locator::parse_source;
     use crate::predicate::Predicate;
-    use crate::schema::{Fact, GroundBinding, GroundSource, Groundedness, Resolved};
+    use crate::schema::{
+        Claim, Fact, FactValue, GroundBinding, GroundSource, Groundedness, Resolved, TriageSource,
+        Volatility,
+    };
     use crate::test_support::verified_scalar;
-    use crate::write::Outcome;
+    use crate::write::{Outcome, WriteOp};
     use chrono::Utc;
 
+    fn scalar(value: &str) -> FactValue {
+        FactValue::Scalar {
+            value: serde_json::Value::String(value.into()),
+        }
+    }
+
+    fn ingest(store: &KenStore, key: &str) {
+        let claim = Claim::parse_key(key).unwrap();
+        store
+            .apply(WriteOp::ingest(
+                claim,
+                scalar("v"),
+                TriageSource::Ingest,
+                Volatility::Days,
+                None,
+            ))
+            .unwrap();
+    }
+
     #[test]
-    fn parses_jj_version_output() {
-        assert_eq!(parse_jj_version("jj 0.42.0\n"), Some((0, 42)));
-        assert_eq!(parse_jj_version("jj 1.0.3"), Some((1, 0)));
-        assert_eq!(parse_jj_version("garbage"), None);
-        assert_eq!(parse_jj_version(""), None);
+    fn ingest_appends_a_tagged_op_and_undo_reverts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+
+        ingest(&store, "db.host");
+        assert!(store.read_fact_by_key("db.host").is_ok());
+        let log = store.op_log(None).unwrap();
+        assert!(
+            log.iter()
+                .any(|o| o.description.contains("[Ingest]") && o.description.contains("db.host")),
+            "op log should carry a tagged Ingest: {log:?}"
+        );
+
+        store.undo().unwrap();
+        assert!(
+            store.read_fact_by_key("db.host").is_err(),
+            "undo should remove the created fact file"
+        );
+        assert!(
+            store
+                .op_log(None)
+                .unwrap()
+                .iter()
+                .any(|o| o.description.contains("[Undo]")),
+            "undo is itself recorded in the op log"
+        );
+    }
+
+    #[test]
+    fn op_log_since_keeps_only_newer_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+
+        ingest(&store, "x.one");
+        let marker = store.op_log(None).unwrap().first().unwrap().id.clone();
+        ingest(&store, "x.two");
+
+        let since = store.op_log(Some(OpId(marker))).unwrap();
+        assert!(since.iter().all(|o| !o.description.contains("x.one")));
+        assert!(since.iter().any(|o| o.description.contains("x.two")));
     }
 
     fn ground_with(outcome: Option<Outcome>) -> GroundBinding {
@@ -840,17 +861,5 @@ mod tests {
             aggregate_groundedness(&fact),
             Groundedness::Ungrounded { .. }
         ));
-    }
-
-    #[test]
-    fn parse_log_records_splits_on_separators() {
-        let us = '\u{1f}';
-        let rs = '\u{1e}';
-        let out =
-            format!("op1{us}t1{us}[Ingest] a.b{rs}op2{us}t2{us}[GroundCheck:confirmed] a.b{rs}");
-        let records = parse_log_records(&out);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].id, "op1");
-        assert_eq!(records[1].description, "[GroundCheck:confirmed] a.b");
     }
 }

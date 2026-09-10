@@ -1,30 +1,30 @@
 # Belief Store: implementation sketch
 
-A proactive-verification memory system for agents, with jujutsu (`jj`) as the
-storage and versioning spine. Language: Rust, because `jj-lib` is Rust and the
-storage spine wants to live next to it. The LLM-facing orchestration can be any
-language over a thin API; the trust spine is Rust.
+A proactive-verification memory system for agents.
+The store is a directory of fact files plus an append-only operation log `ken` owns.
+Language: Rust for the trust spine;
+the LLM-facing orchestration can be any language over a thin API.
 
 ---
 
 ## 0. The core realization
 
-jj already separates the two planes we care about. In its default backend, Git
-holds content-addressed immutable objects (commits, trees, files); a custom
-store outside Git holds higher-level metadata (change IDs, predecessors,
-bookmarks, the operation log). That is the data-plane / control-plane split.
-We don't bolt version control onto a belief store. We model the belief store as
-a jj repo and inherit the properties.
+The store keeps two planes apart.
+The data plane holds what the store believes;
+the control plane holds what a verifier confirmed.
+That split is a code boundary (§3), not a storage trick:
+only a `verify`-module constructor can move groundedness,
+so an untrusted caller can ingest a belief but never assert a confirmation.
 
-| Design concept (this thread)            | jj primitive                          |
-|-----------------------------------------|---------------------------------------|
-| Fact identity (survives re-verification)| change ID (stable)                    |
-| Fact version (changes on every update)  | commit ID (content hash)              |
-| "Two sources disagree", held as data    | first-class conflict object           |
-| Out-of-band append-only audit log       | operation log (`jj op log`)           |
-| Hypothesis you verify then keep/discard  | anonymous change, squash or abandon   |
-| Content-addressing of a fact            | tree/file object hash, free           |
-| Roll the agent's mind back              | `jj op restore` / `jj undo`           |
+The belief machinery needs nothing more than a fact file and an append-only log:
+
+| `ken` concept                          | mechanism                          |
+|-----------------------------------------|------------------------------------|
+| fact identity (survives re-verification)| the `entity.relation` key          |
+| fact version (changes on every update)  | the fact file's bytes              |
+| "two sources disagree", held as data    | `Groundedness::Conflicted`         |
+| out-of-band append-only audit log        | `ops.jsonl`, one record per op     |
+| roll the agent's mind back              | `undo` replays a record in reverse |
 
 The op log is read, not believed. It makes no claim about the world; it records
 what the system did. Same category as repo HEAD and a live API response: a
@@ -48,7 +48,7 @@ enum GroundSource {
 
 /// Believed. Needs verification. The addressable, scheduled, verified unit.
 struct Fact {
-    id: ChangeId,                       // the claim's `entity.relation` key: stable
+    id: FactId,                       // the claim's `entity.relation` key: stable
                                         // identity (survives re-verification), no
                                         // opaque id needed
     claim: Claim,                       // canonical join keys (see below)
@@ -135,7 +135,7 @@ reachable only through the verifier-run path. Enforced at compile time by making
 the privileged constructors private to the verification module.
 
 ```rust
-/// Every mutation of the store is one of these. Each becomes one jj operation,
+/// Every mutation of the store is one of these. Each becomes one op-log record,
 /// tagged in the op description so the invariant is auditable after the fact.
 enum WriteOp {
     /// Data plane. The ONLY op untrusted ingestion may construct.
@@ -145,48 +145,47 @@ enum WriteOp {
 
     /// Control plane. Constructible only inside the `verify` module. Records one
     /// ground check; `by` is the generator hash for a Generator source, else None.
-    GroundCheck { fact: ChangeId, ground: usize, outcome: Outcome, by: Option<GeneratorHash> },
+    GroundCheck { fact: FactId, ground: usize, outcome: Outcome, by: Option<GeneratorHash> },
 
     /// Control plane. Scheduler-only. Adjusts ordering, never truth.
-    Reschedule { fact: ChangeId, new_priority: f64 },
+    Reschedule { fact: FactId, new_priority: f64 },
 
     /// Control plane. Human override, always logged loudly.
-    ManualOverride { fact: ChangeId, set: Epistemics, reason: String },
+    ManualOverride { fact: FactId, set: Epistemics, reason: String },
 }
 
 enum Outcome { Confirmed, Refuted, VerifierErrored, Inconclusive }  // see §6
 ```
 
-jj does not enforce who writes which field; that is application-level via the
-private constructors. What jj gives you is the audit: every `WriteOp` is one
-operation in the op log, tagged with its variant, so you can prove after the
+The store does not enforce who writes which field; that is application-level via
+the private constructors. What the op log gives you is the audit: every
+`WriteOp` is one record, tagged with its variant, so you can prove after the
 fact that `groundedness` only ever moved via `GroundCheck`. Enforcement at write
 time, verification of enforcement at the log.
 
 ---
 
-## 4. The storage seam (CLI-first, jj-lib later)
+## 4. The storage seam
 
-`jj-lib` is real but pre-1.0 and changes fast, so don't couple to it directly
-yet. Put a trait at the seam, implement over the `jj` CLI now (stable, covers
-everything we need), swap to embedded `jj-lib` later if latency demands.
+A fact is a file at a deterministic path (`facts/<entity>/<relation>.json`),
+so the store greps and diffs like code. Every `WriteOp` lands as one tagged
+record in `ops.jsonl`, the append-only log `ken` owns; the log is the audit and
+the fact files are the working state.
 
 ```rust
-trait VersionedStore {
-    fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact>;
-    fn apply(&self, op: WriteOp) -> Result<ChangeId>;     // -> one jj operation
-    fn list_conflicts(&self) -> Result<Vec<ChangeId>>;    // facts in conflict state
-    fn op_log(&self, since: OpId) -> Result<Vec<Operation>>;  // the ground-source audit
-    fn branch_hypothesis(&self, base: Rev) -> Result<Workspace>;  // anonymous change
+impl KenStore {
+    fn read_fact_by_key(&self, key: &str) -> Result<Fact>;
+    fn apply(&self, op: WriteOp) -> Result<FactId>;      // -> one op-log record
+    fn list_conflicts(&self) -> Result<Vec<FactId>>;     // facts in conflict state
+    fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>>;  // the ground-source audit
+    fn undo(&self) -> Result<()>;                        // restore the last op's saved bytes
 }
 ```
 
-CLI mapping, roughly: `apply` writes the fact file and runs `jj describe`
-tagging the op; `read_fact` is `jj file show -r <rev> <path>`; `op_log` is
-`jj op log --template ...`; `branch_hypothesis` is `jj new`; conflicts surface
-through `jj resolve --list`. A fact is a file at a deterministic path, e.g.
-`facts/<entity-hash>/<relation>.json`, so content-addressing is free and a
-disagreeing concurrent write becomes a real jj conflict instead of a lost update.
+`apply` writes the fact file and appends one record tagging the op. Each record
+saves the before and after bytes of the files it touched, so `undo` restores
+them in reverse. Writes serialize behind a store lock, so single-writer is the
+supported posture and a disagreeing write is a later op, not a lost update.
 
 ---
 
@@ -335,8 +334,8 @@ fn audit_probability(f: &Fact) -> f64 {
 }
 // On audit: pick a verifier whose failure mode is uncorrelated with the
 // incumbent (differential / metamorphic check). Agreement earns trust.
-// Disagreement -> Groundedness::Conflicted -> a jj conflict object, carried
-// forward until evidence resolves it.
+// Disagreement -> Groundedness::Conflicted, carried forward until evidence
+// resolves it.
 ```
 
 Noise on the claims does not help, because a wrong verifier is a self-confirming
@@ -394,9 +393,9 @@ Start at the trust spine; everything downstream is regenerable.
 1. **Schema + write authority.** `Fact`, `Epistemics`, `WriteOp`, with the
    privileged constructors private to a `verify` module. Get the control-plane
    boundary compiling before anything touches storage.
-2. **`VersionedStore` over the `jj` CLI.** Fact-as-file, `apply` = one tagged jj
-   op, conflicts surfaced. Now you have identity, versioning, conflicts, and the
-   op-log audit for free.
+2. **The store.** Fact-as-file under `.ken/`, `apply` = one tagged op-log
+   record, conflicts surfaced by groundedness. Now you have identity,
+   versioning, conflicts, and the op-log audit.
 3. **Verifier registry + sandbox.** Content-addressed verifier source *and*
    capabilities (§6a), `run` with blame attribution (§6). Capability-scoped
    execution before the first LLM-drafted verifier runs. LLM verifiers tagged

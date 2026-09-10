@@ -5,7 +5,7 @@
 First release.
 The model is settled (`DESIGN.md`, `THREAT-MODEL.md`)
 and the spine described in the README works:
-the jj-backed store, the data/control-plane split,
+the file-backed store and its op log, the data/control-plane split,
 typed ground sources (File, Command, Generator, Handler),
 heading/quote/line-range locators, pure predicates,
 multi-ground conflicts, Kalman confidence decay,
@@ -49,8 +49,8 @@ that has not yet aggregated to a full conflict.
 - Ingest applies the fitted Platt recalibration map
   to LLM-triaged confidence (identity until enough samples),
   closing the self-calibration loop end to end.
-- The store enforces a minimum supported `jj` version at startup
-  and refuses to run against an older one.
+- The store is plain files with an append-only op log (`ops.jsonl`):
+  every write is one tagged record, and `ken undo` restores the last op's saved bytes.
 - `ken serve --install-launch-agent` (macOS) writes the launchd plist,
   loads it with `launchctl bootstrap`, and captures logs;
   other platforms get a clear error pointing at their service manager.

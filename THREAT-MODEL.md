@@ -60,7 +60,7 @@ The class you harden with quotas.
 | Citation fan-in   | One inferred fact depends on too many others             | In-degree cap                                                        |
 | Cascade fan-out   | One ground source a thousand facts depend on             | Out-degree cap                                                       |
 | Depth             | Propagation recurses into a stack overflow               | Max dependency depth                                                 |
-| Oversized value   | A single fact balloons storage                           | Per-value byte cap (jj's 1 MiB file limit is a backstop, not policy) |
+| Oversized value   | A single fact balloons storage                           | Per-value byte cap enforced by `ken`, not left to the filesystem     |
 | Flood             | Mass ingest exhausts nodes, edges, budget                | Per-source rate limit; total node and edge budgets                   |
 
 Bound Katz centrality's alpha below the reciprocal of the graph's spectral radius,
@@ -172,11 +172,11 @@ That root must itself be defended.
 
 | Attack             | In the store                                                       | Defense                                                              |
 |--------------------|--------------------------------------------------------------------|----------------------------------------------------------------------|
-| History rewrite    | `jj op abandon` or `restore` rewrites the audit log                | Hash-chain the op-log heads; sign and anchor them to an external append-only store; access-control the rewriting operations |
+| History rewrite    | Editing or truncating `ops.jsonl` rewrites the audit log           | Hash-chain the op-log records; sign and anchor them to an external append-only store; access-control the store directory |
 | Long-range attack  | An attacker with store access forges a plausible alternate past    | Weak subjectivity: a consumer trusts the latest signed checkpoint, not a re-derivation from genesis |
 
-jj's operation log is append-only in practice but not cryptographically sealed,
-so anchoring recent hash-chained heads on a schedule is what makes the long-range attack infeasible.
+The op log is append-only by convention (`ken` only ever appends), but the file is not cryptographically sealed,
+so anchoring recent hash-chained records on a schedule is what makes the long-range attack infeasible.
 Before the latest checkpoint, history cannot be plausibly forged.
 
 ## G. Input and key safety

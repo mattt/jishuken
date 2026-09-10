@@ -3,7 +3,7 @@
 //! place the full [`Fact`] skeleton lives.
 
 use crate::schema::{
-    ChangeId, Claim, Epistemics, Fact, FactValue, GeneratorHash, Groundedness, Provenance,
+    Claim, Epistemics, Fact, FactId, FactValue, GeneratorHash, Groundedness, Provenance,
     ScheduleMeta, Volatility,
 };
 use chrono::Utc;
@@ -15,7 +15,7 @@ pub(crate) fn verified_scalar(key: &str) -> Fact {
     let now = Utc::now();
     let claim = Claim::parse_key(key).expect("valid test key");
     Fact {
-        id: ChangeId::for_claim(&claim),
+        id: FactId::for_claim(&claim),
         claim,
         value: FactValue::Scalar {
             value: serde_json::json!("v"),

@@ -9,10 +9,10 @@ use chrono::Utc;
 use crate::error::{Error, Result};
 use crate::ground::{read_binding, ReadResult};
 use crate::schema::{
-    Capabilities, ChangeId, Element, Fact, FactValue, GeneratorHash, GroundBinding, GroundSource,
+    Capabilities, Element, Fact, FactId, FactValue, GeneratorHash, GroundBinding, GroundSource,
     Groundedness, Outcome, Resolved,
 };
-use crate::store::{JjStore, VersionedStore};
+use crate::store::KenStore;
 use crate::verify::authority;
 
 /// The product of reading and judging one ground: the verdict, the replay
@@ -34,14 +34,14 @@ fn ground_by(binding: &GroundBinding) -> Option<GeneratorHash> {
 /// # Errors
 /// Returns an error if the fact is unknown, has no grounds bound, or a store
 /// read or write fails.
-pub fn verify_fact(store: &JjStore, key: &str) -> Result<Groundedness> {
+pub fn verify_fact(store: &KenStore, key: &str) -> Result<Groundedness> {
     verify_fact_inner(store, key, true)
 }
 
 /// Check every ground of a fact, optionally recomputing centrality after each
 /// `GroundCheck`. Single-shot callers recompute (fresh centrality); the
 /// scheduler tick defers it to one recompute after the whole tick (Idea 1).
-fn verify_fact_inner(store: &JjStore, key: &str, recompute: bool) -> Result<Groundedness> {
+fn verify_fact_inner(store: &KenStore, key: &str, recompute: bool) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
     if fact.grounds.is_empty() {
         return Err(Error::Verifier(format!(
@@ -62,7 +62,7 @@ fn verify_fact_inner(store: &JjStore, key: &str, recompute: bool) -> Result<Grou
 /// # Errors
 /// Returns an error if the fact is unknown, has no grounds, or a store read or
 /// write fails.
-pub fn audit_fact(store: &JjStore, key: &str, recompute: bool) -> Result<Groundedness> {
+pub fn audit_fact(store: &KenStore, key: &str, recompute: bool) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
     if fact.grounds.is_empty() {
         return Err(Error::Verifier(format!(
@@ -98,8 +98,8 @@ fn independent_indices(fact: &Fact) -> Vec<usize> {
 /// Check the given grounds of a fact and apply one `GroundCheck` op each. When
 /// `recompute` is false the caller is responsible for a later
 /// `recompute_centrality` (the tick coalesces it, Idea 1).
-fn run_checks(store: &JjStore, fact: &Fact, idxs: &[usize], recompute: bool) -> Result<()> {
-    let id = ChangeId::for_claim(&fact.claim);
+fn run_checks(store: &KenStore, fact: &Fact, idxs: &[usize], recompute: bool) -> Result<()> {
+    let id = FactId::for_claim(&fact.claim);
     for &idx in idxs {
         let (outcome, resolved, set_update, observed_cost) = check_ground(store, fact, idx)?;
         let by = ground_by(&fact.grounds[idx]);
@@ -128,7 +128,7 @@ fn run_checks(store: &JjStore, fact: &Fact, idxs: &[usize], recompute: bool) -> 
 /// # Errors
 /// Currently infallible; the `Result` mirrors the `GroundCheck` op it feeds, as
 /// source-read failures are reported as an [`Outcome`] rather than an error.
-pub fn check_ground(store: &JjStore, fact: &Fact, idx: usize) -> Result<GroundOutcome> {
+pub fn check_ground(store: &KenStore, fact: &Fact, idx: usize) -> Result<GroundOutcome> {
     let binding = &fact.grounds[idx];
     let now = Utc::now();
     let claim = fact.value.as_env();
@@ -235,9 +235,9 @@ fn bump(prior: f64) -> f64 {
 ///
 /// # Errors
 /// Returns an error if the fact is unknown or a store read or write fails.
-pub fn ground(store: &JjStore, key: &str, binding: GroundBinding) -> Result<Groundedness> {
+pub fn ground(store: &KenStore, key: &str, binding: GroundBinding) -> Result<Groundedness> {
     let fact = store.read_fact_by_key(key)?;
-    let id = ChangeId::for_claim(&fact.claim);
+    let id = FactId::for_claim(&fact.claim);
     store.apply(authority::ground(id.clone(), binding))?;
 
     let fact = store.read_fact_by_key(key)?;
@@ -264,7 +264,7 @@ pub fn ground(store: &JjStore, key: &str, binding: GroundBinding) -> Result<Grou
 /// Returns an error if the generator source cannot be read or re-registered, or
 /// a store read or write fails.
 pub fn grant(
-    store: &JjStore,
+    store: &KenStore,
     generator_path: &std::path::Path,
     net: &[String],
     read: &[String],
@@ -304,7 +304,7 @@ pub fn grant(
 /// parallel) read phase to the serial apply phase of a tick.
 struct Check {
     key: String,
-    id: ChangeId,
+    id: FactId,
     idx: usize,
     by: Option<GeneratorHash>,
     outcome: Outcome,
@@ -315,11 +315,11 @@ struct Check {
 
 /// Read and judge one ground into a [`Check`]. Read-only: no store writes, so it
 /// is safe to run on many threads at once.
-fn do_check(store: &JjStore, fact: &Fact, idx: usize) -> Result<Check> {
+fn do_check(store: &KenStore, fact: &Fact, idx: usize) -> Result<Check> {
     let (outcome, resolved, set_update, observed_cost) = check_ground(store, fact, idx)?;
     Ok(Check {
         key: fact.claim.key(),
-        id: ChangeId::for_claim(&fact.claim),
+        id: FactId::for_claim(&fact.claim),
         idx,
         by: ground_by(&fact.grounds[idx]),
         outcome,
@@ -330,9 +330,9 @@ fn do_check(store: &JjStore, fact: &Fact, idx: usize) -> Result<Check> {
 }
 
 /// Run the read phase over `work`, on up to `concurrency` threads. Writes are
-/// never parallel (jj serializes them); only these read-only checks fan out.
+/// never parallel (the store lock serializes them); only these read-only checks fan out.
 fn run_check_phase(
-    store: &JjStore,
+    store: &KenStore,
     work: &[(&Fact, usize)],
     concurrency: usize,
 ) -> Result<Vec<Check>> {
@@ -366,13 +366,13 @@ fn run_check_phase(
 /// One scheduler tick (DESIGN §7): check the top `VoI` facts under budget, plus
 /// an exploration-floor audit of confident high-consequence facts through their
 /// independent grounds. Reads fan out under `budget.concurrency`; the resulting
-/// ops are applied serially (jj is the write-serialization point) and centrality
+/// ops are applied serially (the store lock is the write-serialization point) and centrality
 /// is recomputed once for the whole tick (Idea 1). Returns the keys checked and
 /// their resulting groundedness.
 ///
 /// # Errors
 /// Returns an error if listing the store's facts or a check/apply fails.
-pub fn tick(store: &JjStore) -> Result<Vec<(String, Groundedness)>> {
+pub fn tick(store: &KenStore) -> Result<Vec<(String, Groundedness)>> {
     let now = Utc::now();
     let facts = store.all_facts()?;
     let costs = store.cost_table();

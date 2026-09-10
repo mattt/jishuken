@@ -1,5 +1,5 @@
 //! Write authority (DESIGN §3). Every mutation is one [`WriteOp`] and becomes
-//! one jj operation, tagged in the op description so the invariant is auditable.
+//! one op-log record, tagged in the description so the invariant is auditable.
 //!
 //! The control-plane constructors live in [`crate::verify::authority`] and
 //! require a [`ControlToken`], whose only field is private to that module.
@@ -10,11 +10,11 @@
 //! a data-plane caller cannot mint the authorization token:
 //!
 //! ```compile_fail
-//! use ken::schema::{ChangeId, Outcome};
+//! use ken::schema::{FactId, Outcome};
 //! use ken::write::WriteOp;
 //! // error: cannot construct GroundCheck; field `_auth` (ControlToken) is private
 //! let _ = WriteOp::GroundCheck {
-//!     fact: ChangeId("x".into()),
+//!     fact: FactId("x".into()),
 //!     ground: 0,
 //!     outcome: Outcome::Confirmed,
 //!     by: None,
@@ -26,7 +26,7 @@
 
 use crate::calibration::Recalibrator;
 use crate::schema::{
-    ChangeId, Claim, Element, Epistemics, FactValue, GeneratorHash, GroundBinding, Resolved,
+    Claim, Element, Epistemics, FactId, FactValue, GeneratorHash, GroundBinding, Resolved,
     TriageSource, Volatility,
 };
 use crate::verify::ControlToken;
@@ -43,7 +43,7 @@ pub const INGEST_CONFIDENCE_CEILING: f64 = 0.5;
 /// prior, well under the ceiling, pending its first ground check.
 const INGEST_DEFAULT_CONFIDENCE: f64 = 0.4;
 
-/// Every mutation of the store. Each becomes one tagged jj operation.
+/// Every mutation of the store. Each becomes one tagged op-log record.
 #[derive(Debug, Clone)]
 pub enum WriteOp {
     /// Data plane. The ONLY op untrusted ingestion may construct. Always lands
@@ -61,7 +61,7 @@ pub enum WriteOp {
     /// Control plane. Bind an independent ground source to a fact (`ken ground`).
     /// A privilege escalation, logged loudly (DESIGN §10).
     Ground {
-        fact: ChangeId,
+        fact: FactId,
         binding: GroundBinding,
         _auth: ControlToken,
     },
@@ -70,7 +70,7 @@ pub enum WriteOp {
     /// can move `groundedness` (DESIGN §2, §3). `by` is the generator hash for a
     /// `Generator` source, else `None`/a synthetic marker.
     GroundCheck {
-        fact: ChangeId,
+        fact: FactId,
         ground: usize,
         outcome: Outcome,
         by: Option<GeneratorHash>,
@@ -86,14 +86,14 @@ pub enum WriteOp {
 
     /// Control plane. Scheduler-only. Adjusts ordering, never truth.
     Reschedule {
-        fact: ChangeId,
+        fact: FactId,
         new_priority: f64,
         _auth: ControlToken,
     },
 
     /// Control plane. Human override, always logged loudly.
     ManualOverride {
-        fact: ChangeId,
+        fact: FactId,
         set: Epistemics,
         reason: String,
         _auth: ControlToken,
@@ -118,7 +118,7 @@ impl WriteOp {
         }
     }
 
-    /// The variant name, used to tag the jj operation so the audit is greppable.
+    /// The variant name, used to tag the op-log record so the audit is greppable.
     pub fn tag(&self) -> String {
         match self {
             WriteOp::Ingest { .. } => "Ingest".to_string(),

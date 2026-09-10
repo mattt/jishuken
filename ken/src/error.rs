@@ -13,8 +13,8 @@ pub enum Error {
     #[error("invalid key: {0}")]
     Key(#[from] crate::schema::KeyError),
 
-    #[error("jj command failed: {0}")]
-    Jj(String),
+    #[error("store error: {0}")]
+    Store(String),
 
     #[error("verifier error: {0}")]
     Verifier(String),

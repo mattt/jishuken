@@ -1,8 +1,7 @@
 //! A compact, mergeable t-digest (the `DataSketches` / Circllhist idea). Used to
 //! turn a generator's static `cost_estimate` into a measured quantile of its
-//! observed run times. Mergeability is the point: a digest survives `jj op
-//! restore` and pools across every fact that shares a generator, the same way a
-//! sketch merges across shards.
+//! observed run times. Mergeability is the point: a digest pools across every
+//! fact that shares a generator, the same way a sketch merges across shards.
 
 use serde::{Deserialize, Serialize};
 

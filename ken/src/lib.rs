@@ -1,7 +1,7 @@
-//! Jishuken (`ken`): self-verifying memory for agents, with jujutsu as the
-//! storage and versioning spine. See `DESIGN.md` for the model and `README.md`
-//! for the surface. The trust spine is: schema → write authority → store →
-//! verifier → kalman → scheduler → centrality.
+//! Jishuken (`ken`): self-verifying memory for agents. The store is a directory
+//! of fact files with an append-only op log. See `DESIGN.md` for the model and
+//! `README.md` for the surface. The trust spine is: schema → write authority →
+//! store → verifier → kalman → scheduler → centrality.
 
 pub mod calibration;
 pub mod centrality;

@@ -131,7 +131,7 @@ fn lang_for(path: &str) -> String {
 }
 
 /// Render a ground binding's source to its human string form, shared by `why`,
-/// `recall`, the MCP surface, and the tagged jj op label.
+/// `recall`, the MCP surface, and the tagged op-log label.
 pub fn render_ground(binding: &GroundBinding) -> String {
     match &binding.source {
         GroundSource::File(src) => render_source(src, &binding.locator),

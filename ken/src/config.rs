@@ -40,13 +40,24 @@ impl CommandCfg {
     }
 }
 
-/// Which VCS a source root is read through.
+/// Which VCS a source root is read through, when a revision is pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Vcs {
     #[default]
-    Jj,
     Git,
+    Jj,
+}
+
+/// Detect the VCS backing a directory (for pinned-revision reads). Defaults to
+/// `Git` when neither a `.jj/` nor a `.git/` is present; a revision read then
+/// fails with a clear VCS error rather than silently succeeding.
+fn detect_vcs(root: &Path) -> Vcs {
+    if root.join(".jj").is_dir() {
+        Vcs::Jj
+    } else {
+        Vcs::Git
+    }
 }
 
 /// A named source mount (README "Configuration"). Either repo-backed (`repo`,
@@ -224,9 +235,12 @@ impl Config {
                 let parent = store_root
                     .parent()
                     .ok_or_else(|| Error::Config("store has no parent project".into()))?;
-                Ok((parent.to_path_buf(), Vcs::Jj))
+                let vcs = detect_vcs(parent);
+                Ok((parent.to_path_buf(), vcs))
             }
-            SourceRoot::Store => Ok((store_root.to_path_buf(), Vcs::Jj)),
+            // The store is a plain directory now, not a repo: `store:` reads are
+            // filesystem-only, so a pinned revision has no VCS to resolve it.
+            SourceRoot::Store => Ok((store_root.to_path_buf(), Vcs::Git)),
             SourceRoot::Named(name) => {
                 let cfg = self
                     .sources

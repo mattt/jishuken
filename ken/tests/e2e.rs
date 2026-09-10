@@ -1,5 +1,5 @@
-//! End-to-end tests against a real jj-backed store. Gated on the `jj` CLI being
-//! available, per the task brief; skip cleanly otherwise.
+//! End-to-end tests against a real store: a `.ken/` directory of fact files and
+//! an append-only op log, no external VCS required.
 
 use ken::engine;
 use ken::ground::locator::parse_source;
@@ -8,11 +8,11 @@ use ken::schema::{
     Claim, CommandSource, FactValue, GroundBinding, GroundSource, Groundedness, SourceRoot,
     TriageSource, Volatility,
 };
-use ken::store::{jj_available, JjStore, OpId, Rev, VersionedStore};
+use ken::store::{KenStore, OpId};
 use ken::write::{WriteOp, INGEST_CONFIDENCE_CEILING};
 
 /// Bind a File ground via a locator string + predicate spec, then check it.
-fn ground_file(store: &JjStore, key: &str, source: &str, predicate: &str) -> Groundedness {
+fn ground_file(store: &KenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
     let (src, locator) = parse_source(source, None).unwrap();
     let binding = GroundBinding {
         source: GroundSource::File(src),
@@ -25,7 +25,7 @@ fn ground_file(store: &JjStore, key: &str, source: &str, predicate: &str) -> Gro
 
 /// Bind a ground via a locator string, resolving handler-backed schemes through
 /// config, then check it.
-fn ground_via_config(store: &JjStore, key: &str, source: &str, predicate: &str) -> Groundedness {
+fn ground_via_config(store: &KenStore, key: &str, source: &str, predicate: &str) -> Groundedness {
     let (src, locator) = parse_source(source, None).unwrap();
     let source = ken::ground::ground_source_for(store.config(), store.root(), src).unwrap();
     let binding = GroundBinding {
@@ -37,17 +37,13 @@ fn ground_via_config(store: &JjStore, key: &str, source: &str, predicate: &str) 
     engine::ground(store, key, binding).unwrap()
 }
 
-fn fresh_store() -> Option<(tempfile::TempDir, JjStore)> {
-    if !jj_available() {
-        eprintln!("skipping: jj not on PATH");
-        return None;
-    }
+fn fresh_store() -> (tempfile::TempDir, KenStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = JjStore::init(&dir.path().join(".ken")).unwrap();
-    Some((dir, store))
+    let store = KenStore::init(&dir.path().join(".ken")).unwrap();
+    (dir, store)
 }
 
-fn ingest(store: &JjStore, key: &str, value: &str, vol: Volatility) -> ken::schema::ChangeId {
+fn ingest(store: &KenStore, key: &str, value: &str, vol: Volatility) -> ken::schema::FactId {
     let claim = Claim::parse_key(key).unwrap();
     store
         .apply(WriteOp::ingest(
@@ -66,9 +62,7 @@ fn ingest(store: &JjStore, key: &str, value: &str, vol: Volatility) -> ken::sche
 
 #[test]
 fn init_add_recall_roundtrip() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(
         &store,
         "staging.url",
@@ -89,61 +83,58 @@ fn init_add_recall_roundtrip() {
 
 #[test]
 fn ingest_is_one_tagged_op_in_the_log() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(&store, "db.host", "10.0.0.1", Volatility::Slow);
-    let ops = store.change_log().unwrap();
+    let ops = store.op_log(None).unwrap();
     assert!(
         ops.iter()
             .any(|o| o.description.contains("[Ingest]") && o.description.contains("db.host")),
-        "change log should contain a tagged Ingest op: {ops:?}"
+        "op log should contain a tagged Ingest op: {ops:?}"
     );
-    // The op log (what the system did) is still available for `ken log`.
-    assert!(!store.op_log(None).unwrap().is_empty());
 }
 
 #[test]
-fn read_at_revision_uses_jj_file_show() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
-    let id = ingest(&store, "svc.port", "8080", Volatility::Days);
-    // The committed revision is the parent of the working copy after `jj commit`.
-    let at = store.read_fact(&id, Rev::At("@-".into())).unwrap();
-    assert_eq!(at.value.render(), "8080");
+fn recall_reads_the_ingested_fact_file() {
+    let (_dir, store) = fresh_store();
+    ingest(&store, "svc.port", "8080", Volatility::Days);
+    let fact = store.read_fact_by_key("svc.port").unwrap();
+    assert_eq!(fact.value.render(), "8080");
 }
 
 #[test]
 fn undo_rolls_back_one_operation() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(&store, "a.b", "1", Volatility::Days);
-    let before = store.op_log(None).unwrap().len();
-    // `ken undo` maps to `jj undo`: it rolls the store back one operation and
-    // succeeds against the real repo (jj records the undo itself as an op).
+    assert!(store.read_fact_by_key("a.b").is_ok());
+    // `ken undo` restores the saved bytes of the last op: the created fact file
+    // is removed, and the undo itself is recorded as an op.
     store.undo().unwrap();
-    let head = store.op_log(None).unwrap();
-    assert!(head.len() > before, "undo is itself recorded in the op log");
+    assert!(
+        store.read_fact_by_key("a.b").is_err(),
+        "undo should remove the created fact"
+    );
+    assert!(
+        store
+            .op_log(None)
+            .unwrap()
+            .iter()
+            .any(|o| o.description.contains("[Undo]")),
+        "undo is itself recorded in the op log"
+    );
 }
 
 #[test]
 fn discovery_walks_up_for_dot_ken() {
-    let Some((dir, _store)) = fresh_store() else {
-        return;
-    };
+    let (dir, _store) = fresh_store();
     let nested = dir.path().join("src").join("deep");
     std::fs::create_dir_all(&nested).unwrap();
-    let found = JjStore::discover(None, &nested).unwrap();
+    let found = KenStore::discover(None, &nested).unwrap();
     assert_eq!(found.root(), dir.path().join(".ken"));
 }
 
 #[test]
 fn op_log_since_truncates() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(&store, "x.one", "1", Volatility::Days);
     let mid = store.op_log(None).unwrap();
     let marker = mid.first().unwrap().id.clone();
@@ -157,9 +148,7 @@ fn op_log_since_truncates() {
 /// re-check resolves to the same span hash (the cheap tier-2 path).
 #[test]
 fn tier1_existence_grounds_and_reconfirms() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("data.txt"), "hello world").unwrap();
     ingest(&store, "doc.greeting", "hello", Volatility::Days);
 
@@ -183,9 +172,7 @@ fn tier1_existence_grounds_and_reconfirms() {
 /// and surface in `ken conflicts`. Pure tier-1, no sandbox needed.
 #[test]
 fn two_independent_grounds_disagree_conflict() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("src.txt"), "auth lives here").unwrap();
     ingest(&store, "auth.handler", "auth lives here", Volatility::Days);
 
@@ -217,9 +204,7 @@ fn two_independent_grounds_disagree_conflict() {
 /// rather than one per check.
 #[test]
 fn tick_checks_grounded_facts() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     for key in ["thing.exists", "other.exists", "third.exists"] {
         ingest(&store, key, "present", Volatility::Hours);
@@ -231,7 +216,7 @@ fn tick_checks_grounded_facts() {
 
     // Multiple facts were checked, but the tick recomputed centrality once.
     let centrality_ops = store
-        .change_log()
+        .op_log(None)
         .unwrap()
         .into_iter()
         .filter(|o| o.description.contains("[Centrality]"))
@@ -246,16 +231,14 @@ fn tick_checks_grounded_facts() {
 /// still applies serially and coalesces centrality into one op (Part B).
 #[test]
 fn concurrent_tick_checks_all_and_coalesces_centrality() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     // Raise concurrency in the store config, then reopen so it loads.
     let toml = store
         .config()
         .to_toml()
         .replace("concurrency = 1", "concurrency = 4");
     std::fs::write(store.root().join("ken.toml"), toml).unwrap();
-    let store = JjStore::open(store.root()).unwrap();
+    let store = KenStore::open(store.root()).unwrap();
 
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     let keys = ["a.exists", "b.exists", "c.exists", "d.exists"];
@@ -272,7 +255,7 @@ fn concurrent_tick_checks_all_and_coalesces_centrality() {
         );
     }
     let centrality_ops = store
-        .change_log()
+        .op_log(None)
         .unwrap()
         .into_iter()
         .filter(|o| o.description.contains("[Centrality]"))
@@ -288,9 +271,7 @@ fn concurrent_tick_checks_all_and_coalesces_centrality() {
 /// audit surfaces it as Conflicted, never letting the incumbent re-confirm itself.
 #[test]
 fn audit_through_independent_ground_flips_to_conflicted() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("a.txt"), "auth lives here").unwrap();
     std::fs::write(store.root().join("b.txt"), "auth lives here").unwrap();
     ingest(&store, "auth.handler", "auth lives here", Volatility::Days);
@@ -326,9 +307,7 @@ fn audit_through_independent_ground_flips_to_conflicted() {
 /// A `contains` predicate over a File source judges the span against the claim.
 #[test]
 fn predicate_contains_judges_span() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("cfg.txt"), "port = 8080\nhost = local").unwrap();
     ingest(&store, "svc.port", "8080", Volatility::Days);
     // The span (whole file) contains the claim "8080" -> Confirmed.
@@ -347,9 +326,7 @@ fn predicate_contains_judges_span() {
 /// no spawn) and never grounds the fact.
 #[test]
 fn command_allowlist_denies_unlisted_program() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(&store, "svc.health", "ok", Volatility::Hours);
     // `[command] allow` is empty by default, so any command is denied.
     let binding = GroundBinding {
@@ -374,9 +351,7 @@ fn command_allowlist_denies_unlisted_program() {
 /// with a pure predicate. Gated on Deno being available.
 #[test]
 fn handler_scheme_grounds_with_locator_projection() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     if !ken::ground::Sandbox::new("deno", std::time::Duration::from_secs(10)).available() {
         eprintln!("skipping: deno not on PATH");
         return;
@@ -396,7 +371,7 @@ fn handler_scheme_grounds_with_locator_projection() {
         store.config().to_toml()
     );
     std::fs::write(root.join("ken.toml"), cfg).unwrap();
-    let store = JjStore::open(&root).unwrap();
+    let store = KenStore::open(&root).unwrap();
 
     ingest(&store, "auth.handler", "src/auth.rs", Volatility::Days);
     let g = ground_via_config(
@@ -418,7 +393,7 @@ fn handler_scheme_grounds_with_locator_projection() {
 }
 
 /// Run the ken binary against a store and return stdout, asserting success.
-fn ken_cli(store: &JjStore, args: &[&str]) -> String {
+fn ken_cli(store: &KenStore, args: &[&str]) -> String {
     let mut full = vec!["--store", store.root().to_str().unwrap()];
     full.extend_from_slice(args);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ken"))
@@ -437,9 +412,7 @@ fn ken_cli(store: &JjStore, args: &[&str]) -> String {
 /// The control plane moves groundedness; the recall carries the epistemics.
 #[test]
 fn cli_ground_verify_recall_roundtrip() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("cfg.txt"), "port = 8080").unwrap();
 
     ken_cli(&store, &["add", "svc.port", "8080", "--volatility", "days"]);
@@ -466,9 +439,7 @@ fn cli_ground_verify_recall_roundtrip() {
 /// `ken tick` over the binary checks due grounded facts and reports outcomes.
 #[test]
 fn cli_tick_checks_due_facts() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("d.txt"), "present").unwrap();
     ken_cli(
         &store,
@@ -494,9 +465,7 @@ fn cli_tick_checks_due_facts() {
 /// `ken calibration` reports the samples that ground checks accumulated.
 #[test]
 fn cli_calibration_reports_accumulated_samples() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     std::fs::write(store.root().join("a.txt"), "value present").unwrap();
     ken_cli(&store, &["add", "one.fact", "value present"]);
     ken_cli(
@@ -530,9 +499,7 @@ fn cli_calibration_reports_accumulated_samples() {
 /// `ken search` over the binary lists facts and honors the groundedness filter.
 #[test]
 fn search_binary_lists_and_filters() {
-    let Some((_dir, store)) = fresh_store() else {
-        return;
-    };
+    let (_dir, store) = fresh_store();
     ingest(&store, "alpha.one", "v1", Volatility::Days);
     ingest(&store, "beta.two", "v2", Volatility::Days);
 

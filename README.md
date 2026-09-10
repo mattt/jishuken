@@ -10,14 +10,12 @@ so the agent knows when to hedge or ask.
 > **Status:** 0.1.0.
 > The model is settled (see `DESIGN.md` and `THREAT-MODEL.md`)
 > and the spine described in this README works:
-> the jj-backed store, the data/control-plane split,
+> the file-backed store and its op log, the data/control-plane split,
 > typed ground sources and locators, multi-ground conflicts,
 > the scheduler, self-calibration, and the MCP data plane.
 > What is deferred is listed plainly under [Limitations](#limitations),
 > starting with tree-sitter locators (`#ts:`), which parse but do not yet resolve;
 > use a heading, quoted substring, or line-range locator in the meantime.
-> `ken` pins to a supported `jj` version until jj reaches 1.0
-> and refuses to run against an older one.
 
 ## The problem
 
@@ -131,39 +129,38 @@ so a raw range is the weakest anchor and `ken` always pairs it with the span's c
 A heading or a tree-sitter query survives edits elsewhere in the file,
 which is why they are the preferred anchors for prose and for code respectively.
 
-### The store is a jj repo
+### The store is files and an op log
 
 `ken` does not reimplement version control.
-The store is a Jujutsu repository,
-and the belief machinery falls out of jj's primitives:
-
-| `ken` concept                  | jj primitive            |
-|--------------------------------|-------------------------|
-| fact identity (stable)         | change ID               |
-| fact version (per update)      | commit ID               |
-| two answers held at once       | first-class conflict    |
-| the audit log (a ground source)| operation log           |
-| a hypothesis you test and keep | anonymous change        |
-| roll the store back            | `jj op restore`         |
-
-Facts are files in that repo,
+A fact is a file at `facts/<entity>/<relation>.json`,
 so the whole store greps, diffs, and reviews like code,
 because it is code-shaped on disk.
+Every write lands as one tagged record in an append-only log (`ops.jsonl`):
+the log is the audit, the fact files are the working state.
+
+| `ken` concept                  | mechanism                          |
+|--------------------------------|------------------------------------|
+| fact identity (stable)         | the `entity.relation` key          |
+| fact version (per update)      | the fact file's bytes              |
+| two answers held at once       | `Groundedness::Conflicted`         |
+| the audit log (a ground source)| `ops.jsonl`, one record per write  |
+| roll the store back            | `ken undo`                         |
+
+Each op-log record saves the before and after bytes of the files it touched,
+so `ken undo` restores them in reverse.
+Writes serialize behind a store lock; single-writer is the supported posture.
 
 ### Where the store lives
 
-The store is a `.ken/` directory.
+The store is a `.ken/` directory, marked by its `ken.toml`.
 `ken` finds it by walking up from the working directory,
-the way `jj` finds `.jj/`,
+the way `git` finds `.git/`,
 so each project keeps its own beliefs and the right store is the one you are standing in.
 Point somewhere else with `--store` or `KEN_STORE` when you want a shared or global store.
 
-A project that uses `ken` therefore holds two repositories:
-its own `.jj/` for code,
-and a `.ken/` that is itself a jj repo for beliefs.
-`ken` always operates on `.ken/` explicitly and never inherits ambient jj repo discovery,
-so the store is a jj repo `ken` happens to use,
-not the repo you are standing in.
+`ken` always operates on the `.ken/` directory explicitly,
+never inheriting the ambient repo you are standing in,
+so a project's code history and its beliefs stay separate.
 
 ## Install
 
@@ -246,7 +243,7 @@ ken why release.owner   # provenance back to the ground sources, with op IDs
 ken search release      # find facts by entity, relation, text, or groundedness
 ken stale --limit 10    # what is due, ranked by value of information
 ken conflicts           # facts currently holding two answers
-ken log                 # the operation log (this is jj op log underneath)
+ken log                 # the operation log (the tagged ops.jsonl records)
 ken undo                # roll the store back one operation
 ```
 
@@ -342,15 +339,15 @@ Register it like any MCP server:
 
 `ken` is also a Rust crate,
 for embedding in a larger agent runtime.
-The store is reached through one trait:
+The store is a `KenStore` reached through a handful of methods:
 
 ```rust
-trait VersionedStore {
-    fn read_fact(&self, id: &ChangeId, at: Rev) -> Result<Fact>;
-    fn apply(&self, op: WriteOp) -> Result<ChangeId>;   // one op = one jj operation
-    fn list_conflicts(&self) -> Result<Vec<ChangeId>>;
-    fn op_log(&self, since: OpId) -> Result<Vec<Operation>>;
-    fn branch_hypothesis(&self, base: Rev) -> Result<Workspace>;
+impl KenStore {
+    fn read_fact_by_key(&self, key: &str) -> Result<Fact>;
+    fn apply(&self, op: WriteOp) -> Result<FactId>;   // one op = one op-log record
+    fn list_conflicts(&self) -> Result<Vec<FactId>>;
+    fn op_log(&self, since: Option<OpId>) -> Result<Vec<Operation>>;
+    fn undo(&self) -> Result<()>;
 }
 ```
 
@@ -590,8 +587,9 @@ env = ["KB_TOKEN"]     # host vars the handler may read, folded into its hash
 ```
 
 A repo-backed mount reads through its VCS:
-the store reads its jj source via `jj file show` and the git wiki via `git show <rev>:<path>`,
+a jj source via `jj file show` and a git source via `git show <rev>:<path>`,
 pinned per fact by `--rev`.
+The `.ken/` store itself is plain files, so a `store:` source reads from disk.
 A handler-backed mount runs its code in the sandbox instead and reads stdout.
 The reader differs; the locator grammar does not.
 
@@ -600,12 +598,12 @@ The reader differs; the locator grammar does not.
 ```
 my-project/
   .jj/                          the project's own code history
-  .ken/                         the belief store, itself a jj repo
-    .jj/
+  .ken/                         the belief store: plain files, no embedded VCS
+    ken.toml                    config and the store marker
     facts/<entity>/<relation>.json   value, epistemics, ground locators, last-seen span hash
+    ops.jsonl                   the append-only op log (the audit, one record per write)
     verifiers/<hash>.ts
     handlers/<scheme>.ts             reusable scheme handlers (e.g. handlers/wiki.ts)
-    ken.toml
 ../wiki/                        a separate git repo, read as a ground source, never written
   .git/
   Architecture.md
@@ -627,15 +625,12 @@ What 0.1.0 defers, stated plainly so nothing reads as silently missing.
   Reach external sources through a `Command` (`curl` plus a predicate)
   or a handler-backed mount instead.
 - Runtime dependencies are external.
-  `ken` shells out to `jj` (a supported version is enforced at startup),
-  to `deno` for generator and handler sources,
-  and to `git` for git-backed mounts.
-  None are bundled.
+  `ken` shells out to `deno` for generator and handler sources,
+  and to `jj` or `git` for repo-backed mounts read at a pinned revision.
+  None are bundled, and the store itself needs neither.
 - The launch agent is macOS only.
   `ken serve --install-launch-agent` writes and loads a launchd agent;
   on other platforms, run `ken serve` under your own service manager.
-- `branch_hypothesis` is a library surface without a CLI.
-  The jj primitive is wired but nothing user-facing drives it yet.
 
 ## Non-goals
 
@@ -667,4 +662,3 @@ it checks claims against the real source instead of a stored summary (the gemba 
 and *ken* (研, and the English "ken") is the range of what is known.
 The command is `ken`.
 The corpus it keeps is your lore.
-The engine underneath is jujutsu.
