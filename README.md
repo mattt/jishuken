@@ -18,7 +18,13 @@ Keep the store small enough that its contents are worth checking.
 
 The Cargo package and Rust library are named `jishuken`.
 
-Install the `ken` command from crates.io:
+Install the `ken` command with Homebrew:
+
+```sh
+brew install mattt/tap/jishuken
+```
+
+Or install from crates.io:
 
 ```sh
 cargo install jishuken --locked
