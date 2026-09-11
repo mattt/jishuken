@@ -33,6 +33,19 @@ See the [crates.io trusted publishing documentation](https://crates.io/docs/trus
 5. Publish a GitHub release for that tag with release notes.
 6. Confirm the **Publish to crates.io** workflow succeeds and the version is
    available on crates.io.
+7. Confirm **Release binaries** succeeds. It uploads tested archives for macOS
+   (Apple Silicon and Intel, macOS 11 or later) and Linux (ARM64 and x86-64,
+   statically linked with musl), followed by `SHA256SUMS`.
+
+The Homebrew tap checks hourly for complete binary releases and updates
+`Formula/jishuken.rb` with the release URLs and checksums. Its **Update jishuken**
+workflow can also be dispatched manually to update immediately. Homebrew installs
+the precompiled `ken` command without a Rust dependency.
+
+To add binaries to an existing release, run **Release binaries** from `main` with
+the release tag as its `tag` input. Existing archives are preserved on retries;
+the checksums are regenerated from the actual release assets. The crate and tag
+are unchanged.
 
 The workflow checks that the tag matches the crate version, runs the checks,
 and publishes using trusted publishing. It authenticates but skips the upload

@@ -1,0 +1,127 @@
+name: Release binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binaries-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Validate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version=$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "jishuken") | .version')
+          test "$RELEASE_TAG" = "v$version"
+
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          echo "CARGO_TARGET_$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked -p jishuken --bin ken --target "$TARGET"
+
+      - name: Verify Linux binary is static
+        if: runner.os == 'Linux'
+        run: |
+          file "target/$TARGET/release/ken"
+          if readelf -l "target/$TARGET/release/ken" | grep -q INTERP; then
+            echo "The Linux binary requires a dynamic loader." >&2
+            exit 1
+          fi
+
+      - name: Package and test archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist staging
+          cp "target/$TARGET/release/ken" LICENSE README.md staging/
+          tar -czf "dist/jishuken-$RELEASE_TAG-$TARGET.tar.gz" -C staging ken LICENSE README.md
+          smoke=$(mktemp -d)
+          tar -xzf "dist/jishuken-$RELEASE_TAG-$TARGET.tar.gz" -C "$smoke"
+          cd "$smoke"
+          ./ken init
+          ./ken add release.owner ryu --half-life P3D
+          ./ken recall release.owner --json | jq -e '.value == "ryu"'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  upload:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload archives and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft == false' | grep -qx true
+          cd dist
+          # Preserve already-published archives on retries. Re-download them
+          # so the manifest always describes the actual release assets.
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' > ../assets.txt
+          for archive in *.tar.gz; do
+            if grep -Fxq "$archive" ../assets.txt; then
+              gh release download "$RELEASE_TAG" --pattern "$archive" --clobber
+            else
+              gh release upload "$RELEASE_TAG" "$archive"
+            fi
+          done
+          sha256sum -- *.tar.gz > SHA256SUMS
+          # Upload last: this is the signal that all four binaries are ready.
+          gh release upload "$RELEASE_TAG" SHA256SUMS --clobber
