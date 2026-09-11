@@ -18,7 +18,13 @@ Keep the store small enough that its contents are worth checking.
 
 The Cargo package and Rust library are named `jishuken`.
 
-Build and install from a checkout:
+Install the `ken` command from crates.io:
+
+```sh
+cargo install jishuken --locked
+```
+
+Or build and install from a checkout:
 
 ```sh
 git clone https://github.com/mattt/jishuken.git
