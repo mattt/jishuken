@@ -24,6 +24,11 @@ Install the `ken` command with Homebrew:
 brew install mattt/tap/jishuken
 ```
 
+[Precompiled archives](https://github.com/mattt/jishuken/releases/latest)
+are available for macOS and Linux on ARM64 and x86-64.
+Verify downloads against the release's `SHA256SUMS`.
+No Rust toolchain is required.
+
 Or install from crates.io:
 
 ```sh
@@ -43,6 +48,30 @@ The repository pins its toolchain in `rust-toolchain.toml`.
 Ordinary file sources need no other runtime.
 Scripts require Deno.
 Reading a pinned repository revision requires Git or jj.
+
+### Agent skill
+
+The official [ken skill](skills/ken/SKILL.md) guides agents through setup,
+selective memory, and source checks using the CLI or MCP.
+Installing it does not install ken or start background checks.
+
+For Codex, copy it from this checkout into the target project's
+[`.agents/skills` directory](https://developers.openai.com/codex/skills/):
+
+```sh
+mkdir -p /path/to/project/.agents/skills
+cp -R skills/ken /path/to/project/.agents/skills/
+```
+
+Then ask:
+
+```text
+Use $ken to remember the release owner from our runbook
+and set up a check for ownership changes.
+```
+
+For other agents, copy `skills/ken` into their skill directory.
+The skill is self-contained.
 
 ## Usage
 
