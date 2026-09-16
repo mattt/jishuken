@@ -24,12 +24,11 @@ use jishuken::store::JishukenStore;
 use jishuken::write::WriteOp;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    AnnotateAble, CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, Content,
+    CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
     GetPromptRequestParams, GetPromptResult, Implementation, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, Prompt,
-    PromptArgument, PromptMessage, PromptMessageRole, RawResource, RawResourceTemplate,
-    ReadResourceRequestParams, ReadResourceResult, Reference, ResourceContents, ServerCapabilities,
-    ServerInfo,
+    PromptArgument, PromptMessage, ReadResourceRequestParams, ReadResourceResult, Reference,
+    Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{
@@ -304,13 +303,13 @@ impl JishukenServer {
 
         // The JSON payload for clients that read content, plus a resource link
         // per match so a fact can be fetched or attached on demand.
-        let mut content = vec![Content::text(
+        let mut content = vec![ContentBlock::text(
             serde_json::to_string_pretty(&json!({ "matches": matches })).unwrap_or_default(),
         )];
         for f in &hits {
             let key = f.claim.key();
-            content.push(Content::resource_link(
-                RawResource::new(format!("ken://fact/{key}"), key.clone())
+            content.push(ContentBlock::resource_link(
+                Resource::new(format!("ken://fact/{key}"), key.clone())
                     .with_description(format!(
                         "{} ({})",
                         truncate(&f.value.render(), 60),
@@ -654,7 +653,7 @@ fn prompt_messages(
         }
         _ => return None,
     };
-    Some(vec![PromptMessage::new_text(PromptMessageRole::User, text)])
+    Some(vec![PromptMessage::new_text(Role::User, text)])
 }
 
 // --- completion: suggest the keys actually in the store ---
@@ -699,18 +698,16 @@ impl ServerHandler for JishukenServer {
     ) -> Result<ListResourcesResult, ErrorData> {
         let store = self.open_data()?;
         let mut resources = vec![
-            RawResource::new("ken://conflicts", "conflicts")
+            Resource::new("ken://conflicts", "conflicts")
                 .with_title("Facts in conflict")
                 .with_description("Facts currently holding two disagreeing answers.")
-                .with_mime_type("application/json")
-                .no_annotation(),
-            RawResource::new("ken://stale", "stale")
+                .with_mime_type("application/json"),
+            Resource::new("ken://stale", "stale")
                 .with_title("Stale facts")
                 .with_description(
                     "Facts ranked by value of information: most likely to be both wrong and consequential.",
                 )
-                .with_mime_type("application/json")
-                .no_annotation(),
+                .with_mime_type("application/json"),
         ];
         let facts = store
             .all_facts()
@@ -718,14 +715,13 @@ impl ServerHandler for JishukenServer {
         for f in &facts {
             let key = f.claim.key();
             resources.push(
-                RawResource::new(format!("ken://fact/{key}"), key.clone())
+                Resource::new(format!("ken://fact/{key}"), key.clone())
                     .with_description(format!(
                         "{} ({})",
                         truncate(&f.value.render(), 60),
                         f.epistemics.groundedness.label()
                     ))
-                    .with_mime_type("application/json")
-                    .no_annotation(),
+                    .with_mime_type("application/json"),
             );
         }
         Ok(ListResourcesResult::with_all_items(resources))
@@ -737,16 +733,14 @@ impl ServerHandler for JishukenServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
         let templates = vec![
-            RawResourceTemplate::new("ken://fact/{key}", "fact")
+            ResourceTemplate::new("ken://fact/{key}", "fact")
                 .with_title("Fact")
                 .with_description("A fact (`entity.relation`) with its value and full epistemics.")
-                .with_mime_type("application/json")
-                .no_annotation(),
-            RawResourceTemplate::new("ken://why/{key}", "why")
+                .with_mime_type("application/json"),
+            ResourceTemplate::new("ken://why/{key}", "why")
                 .with_title("Provenance")
                 .with_description("Where a fact came from and the ground checks against it.")
-                .with_mime_type("application/json")
-                .no_annotation(),
+                .with_mime_type("application/json"),
         ];
         Ok(ListResourceTemplatesResult::with_all_items(templates))
     }
