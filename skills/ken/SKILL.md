@@ -120,6 +120,7 @@ For requested ongoing checking, use `ken tick` for one scheduling pass
 or `ken serve --interval 5m` with the user's service manager for persistence.
 Neither MCP nor the skill schedules checks automatically.
 `ken stale --limit 10` ranks pending work;
-`ken conflicts` shows disagreements and refuted grounds.
+`ken conflicts` shows facts with conflicting ground outcomes;
+`ken search --grounded refuted` shows facts rejected by their checked grounds.
 Use `ken <command> --help` for other options.
 Report what was saved or checked and any uncertainty relevant to the task.
