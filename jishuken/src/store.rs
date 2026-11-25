@@ -91,6 +91,14 @@ impl Drop for StoreLock {
 }
 
 impl JishukenStore {
+    fn new(root: &Path, config: Config) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            config,
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Discover the store by walking up from `start` for a `.ken/` directory,
     /// the way `git` finds `.git/`. Honors an explicit override first.
     ///
@@ -121,11 +129,7 @@ impl JishukenStore {
             return Err(Error::StoreNotFound);
         }
         let config = Config::load(&root.join("ken.toml"))?;
-        let store = JishukenStore {
-            root: root.to_path_buf(),
-            config,
-            pending: Mutex::new(Vec::new()),
-        };
+        let store = Self::new(root, config);
         // Recover interrupted commits before exposing the working state.
         {
             let _lock = store.lock()?;
@@ -145,20 +149,32 @@ impl JishukenStore {
         GeneratorRegistry::new(&self.root)
     }
 
-    /// Create a `.ken/` store: `ken.toml`, `facts/`, `verifiers/`, and an op log
-    /// seeded with one `[Init]` record.
+    /// Initialize a store, preserving existing settings and operation history.
+    /// Create missing directories and seed an empty log with one `[Init]` record.
     ///
     /// # Errors
-    /// Returns an error if the directories or files cannot be created.
+    /// Returns an error if the store is locked, its settings or history are
+    /// invalid, or its files cannot be read or created.
     pub fn init(root: &Path) -> Result<JishukenStore> {
         std::fs::create_dir_all(root)?;
+        let mut store = Self::new(root, Config::default());
+        let _lock = store.lock()?;
+        let empty_log = store.read_ops()?.is_empty();
         std::fs::create_dir_all(root.join("facts"))?;
         std::fs::create_dir_all(root.join("verifiers"))?;
-        let cfg = Config::default();
-        std::fs::write(root.join("ken.toml"), cfg.to_toml())?;
-        let store = JishukenStore::open(root)?;
-        {
-            let _lock = store.lock()?;
+        let path = root.join("ken.toml");
+        match Config::load(&path) {
+            Ok(config) => store.config = config,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut temp =
+                    tempfile::Builder::new().make_in(root, |p| std::fs::File::create_new(p))?;
+                temp.write_all(store.config.to_toml().as_bytes())?;
+                temp.as_file().sync_all()?;
+                temp.persist_noclobber(path).map_err(|e| e.error)?;
+            }
+            Err(e) => return Err(e),
+        }
+        if empty_log {
             store.append_op("Init", "ken store")?;
         }
         Ok(store)
@@ -936,6 +952,64 @@ mod tests {
                 None,
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn init_preserves_custom_config_and_undo_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let store = JishukenStore::init(root).unwrap();
+        ingest(&store, "db.host");
+        let history = std::fs::read(root.join("ops.jsonl")).unwrap();
+        let custom = b"# Local settings\n[daemon]\ninterval = \"17s\"\n";
+        std::fs::write(root.join("ken.toml"), custom).unwrap();
+
+        let store = JishukenStore::init(root).unwrap();
+        assert_eq!(std::fs::read(root.join("ken.toml")).unwrap(), custom);
+        assert_eq!(store.config().daemon.interval, "17s".parse().unwrap());
+        assert_eq!(std::fs::read(root.join("ops.jsonl")).unwrap(), history);
+        store.undo().unwrap();
+        assert!(store.all_facts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn init_completes_partial_stores() {
+        for log in [None, Some(""), Some(" \n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let custom = b"# Keep this file\n";
+            std::fs::write(root.join("ken.toml"), custom).unwrap();
+            if let Some(text) = log {
+                std::fs::write(root.join("ops.jsonl"), text).unwrap();
+            }
+            let store = JishukenStore::init(root).unwrap();
+            assert_eq!(std::fs::read(root.join("ken.toml")).unwrap(), custom);
+            assert!(root.join("facts").is_dir());
+            assert!(root.join("verifiers").is_dir());
+            let records = store.read_ops().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].tag, "Init");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let history = br#"{"id":"1","time":"t","tag":"Grant","detail":"fixture"}"#;
+        std::fs::write(root.join("ops.jsonl"), history).unwrap();
+        let store = JishukenStore::init(root).unwrap();
+        assert_eq!(store.config(), &crate::config::Config::default());
+        assert_eq!(std::fs::read(root.join("ops.jsonl")).unwrap(), history);
+    }
+
+    #[test]
+    fn init_reports_invalid_config_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let invalid = b"[daemon";
+        std::fs::write(root.join("ken.toml"), invalid).unwrap();
+
+        assert!(JishukenStore::init(root).is_err());
+        assert_eq!(std::fs::read(root.join("ken.toml")).unwrap(), invalid);
+        assert!(!root.join("ops.jsonl").exists());
     }
 
     #[test]
